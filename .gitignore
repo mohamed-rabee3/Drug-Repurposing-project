@@ -1,0 +1,40 @@
+# Environment
+.env
+venv/
+.venv/
+env/
+
+# Data & Models (large files)
+data/
+models/
+cache/
+outputs/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pt
+*.pkl
+*.pickle
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/
