@@ -16,14 +16,23 @@ from graph_module import DrugRepurposingGNN
 from nlp_module import BiomedicalNLP
 from explain_module import RepurposingExplainer
 from eval_module import RepurposingEvaluator
+from dgem_module import DGEMScorer
 
 
 class DrugRepurposingSystem:
     """Main system that orchestrates GNN + NLP for drug repurposing."""
 
     def __init__(self, data_folder="./data", model_folder="./models",
-                 output_folder="./outputs"):
-        """Initialize both modules."""
+                 output_folder="./outputs", enable_dgem=True):
+        """
+        Initialize all modules.
+
+        Args:
+            data_folder: Where TxGNN knowledge graph data is stored.
+            model_folder: Where trained model checkpoints are saved.
+            output_folder: Where results are written.
+            enable_dgem: If True, initialize DGEM gene expression module.
+        """
         self.output_folder = output_folder
         try:
             os.makedirs(output_folder, exist_ok=True)
@@ -32,7 +41,7 @@ class DrugRepurposingSystem:
 
         print("=" * 60)
         print("  AI DRUG REPURPOSING SYSTEM")
-        print("  TxGNN + GPT-OSS 20B (Groq)")
+        print("  TxGNN + DGEM + GPT-OSS 20B (Groq)")
         print("=" * 60)
 
         # Initialize modules
@@ -41,6 +50,17 @@ class DrugRepurposingSystem:
 
         print("\n[SYSTEM] Initializing NLP module...")
         self.nlp = BiomedicalNLP()
+
+        # Initialize DGEM module
+        self.dgem = None
+        if enable_dgem:
+            dgem_folder = os.path.join(data_folder, "dgem")
+            if os.path.exists(dgem_folder):
+                print("\n[SYSTEM] Initializing DGEM module...")
+                self.dgem = DGEMScorer(data_folder=dgem_folder)
+            else:
+                print("\n[SYSTEM] DGEM data not found. Run: python scripts/setup_dgem.py")
+                print("[SYSTEM] Continuing without DGEM (GNN-only mode).")
 
         # Initialize explainability and evaluation modules
         self.explainer = RepurposingExplainer(self.nlp, output_folder)
@@ -73,49 +93,95 @@ class DrugRepurposingSystem:
         """
         Full drug repurposing pipeline for a disease.
 
+        Produces two separate ranked lists:
+          - TxGNN top-k: ranked by GNN embedding similarity
+          - DGEM top-k: ranked by gene expression reversal score
+
         Args:
             disease_name: e.g., "Alzheimer disease"
-            top_k: Number of drug candidates from GNN.
+            top_k: Number of drug candidates from each method.
             explain_top: Number of top drugs to explain via NLP.
 
         Returns:
             Dict with complete results.
         """
+        use_dgem = self.dgem is not None and self.dgem._initialized
+        n_steps = 5 if use_dgem else 4
+
         print(f"\n{'='*60}")
         print(f"  REPURPOSING DRUGS FOR: {disease_name}")
+        if use_dgem:
+            print(f"  Mode: TxGNN + DGEM (separate rankings)")
+        else:
+            print(f"  Mode: TxGNN only")
         print(f"{'='*60}")
         start_time = time.time()
 
         # Step 1: Get disease context from NLP
-        print("\n[Step 1/4] Getting disease context from GPT-OSS 20B...")
+        print(f"\n[Step 1/{n_steps}] Getting disease context from GPT-OSS 20B...")
         disease_context = self.nlp.enrich_disease_context(disease_name)
 
         # Step 2: Get drug predictions from GNN
-        print(f"\n[Step 2/4] Predicting top {top_k} drug candidates with TxGNN...")
+        print(f"\n[Step 2/{n_steps}] Predicting top {top_k} drug candidates "
+              "with TxGNN...")
         try:
             disease_idx = self.gnn.find_disease_idx(disease_name)
-            predictions = self.gnn.predict_drugs_for_disease(
+            gnn_predictions = self.gnn.predict_drugs_for_disease(
                 disease_idx=disease_idx,
                 top_k=top_k
             )
         except (RuntimeError, ValueError) as e:
             print(f"[SYSTEM] GNN prediction failed: {e}")
             print("[SYSTEM] Falling back to NLP-only mode (no GNN scores).")
-            predictions = []
+            gnn_predictions = []
 
-        # Step 3: Explain top predictions with NLP
-        print(f"\n[Step 3/4] Explaining top {explain_top} candidates "
-              "with GPT-OSS 20B...")
-        drug_names = [p["drug"] for p in predictions[:explain_top]]
+        # Step 3: DGEM gene expression scoring — independent top-k
+        dgem_predictions = []
+        if use_dgem:
+            print(f"\n[Step 3/{n_steps}] Scoring ALL drugs with DGEM "
+                  "(gene expression reversal)...")
+
+            # Score all TxGNN drugs (not just GNN top-k)
+            all_drug_names = list(
+                self.dgem.drug_id_mapping.get("name_to_id", {}).keys()
+            ) if self.dgem.drug_id_mapping else []
+
+            dgem_scores = self.dgem.score_drugs_for_disease(
+                disease_name, drug_names=all_drug_names
+            )
+
+            if dgem_scores:
+                # Sort by reversal score descending, take top_k
+                sorted_dgem = sorted(
+                    dgem_scores.items(), key=lambda x: x[1], reverse=True
+                )
+                for rank, (drug, score) in enumerate(sorted_dgem[:top_k]):
+                    dgem_predictions.append({
+                        "drug": drug,
+                        "score": round(score, 6),
+                        "rank": rank + 1,
+                    })
+                print(f"[DGEM] Scored {len(dgem_scores)} drugs, "
+                      f"returning top {len(dgem_predictions)}")
+            else:
+                print("[DGEM] No expression data available for this disease.")
+
+        # Step 4: Explain top predictions with NLP
+        step_explain = 4 if use_dgem else 3
+        print(f"\n[Step {step_explain}/{n_steps}] Explaining top {explain_top} "
+              "candidates with GPT-OSS 20B...")
+        # Explain GNN top drugs
+        drug_names = [p["drug"] for p in gnn_predictions[:explain_top]]
         explanations = (
             self.nlp.batch_explain(disease_name, drug_names)
             if drug_names else {}
         )
 
-        # Step 4: Generate full report
-        print("\n[Step 4/4] Generating comprehensive report...")
-        if predictions:
-            report = self.nlp.generate_report(disease_name, predictions)
+        # Step 5: Generate full report
+        step_report = 5 if use_dgem else 4
+        print(f"\n[Step {step_report}/{n_steps}] Generating comprehensive report...")
+        if gnn_predictions:
+            report = self.nlp.generate_report(disease_name, gnn_predictions)
         else:
             report = self.nlp.generate_report(
                 disease_name, [{"drug": "N/A", "score": 0}]
@@ -123,19 +189,26 @@ class DrugRepurposingSystem:
 
         # Combine results
         elapsed = time.time() - start_time
+        model_name = "TxGNN + DGEM + GPT-OSS-20B" if use_dgem else "TxGNN + GPT-OSS-20B"
         results = {
             "disease": disease_name,
             "disease_context": disease_context,
-            "predictions": predictions,
+            "txgnn_predictions": gnn_predictions,
             "explanations": explanations,
             "report": report,
             "metadata": {
                 "timestamp": datetime.now().isoformat(),
-                "model": "TxGNN + GPT-OSS-20B",
+                "model": model_name,
                 "top_k": top_k,
-                "processing_time_seconds": round(elapsed, 2)
+                "processing_time_seconds": round(elapsed, 2),
+                "dgem_enabled": use_dgem,
             }
         }
+
+        # Add DGEM results as separate section
+        if use_dgem:
+            results["dgem_predictions"] = dgem_predictions
+            results["metadata"]["dgem_drugs_scored"] = len(dgem_scores) if dgem_scores else 0
 
         # Save results
         safe_name = disease_name.replace(" ", "_").lower()
@@ -151,12 +224,19 @@ class DrugRepurposingSystem:
         print(f"  Processing time: {elapsed:.1f} seconds")
         print(f"{'='*60}")
 
-        # Print summary
-        print(f"\n  Top drug candidates for {disease_name}:")
-        for i, pred in enumerate(predictions[:5]):
-            score = pred["score"]
-            drug = pred["drug"]
-            print(f"    {i+1}. {drug} (score: {score:.4f})")
+        # Print TxGNN summary
+        print(f"\n  TxGNN Top {min(5, len(gnn_predictions))} "
+              f"for {disease_name}:")
+        for i, pred in enumerate(gnn_predictions[:5]):
+            print(f"    {i+1}. {pred['drug']} (score: {pred['score']:.4f})")
+
+        # Print DGEM summary
+        if use_dgem and dgem_predictions:
+            print(f"\n  DGEM Top {min(5, len(dgem_predictions))} "
+                  f"for {disease_name}:")
+            for i, pred in enumerate(dgem_predictions[:5]):
+                print(f"    {i+1}. {pred['drug']} "
+                      f"(reversal: {pred['score']:.4f})")
 
         return results
 
@@ -223,10 +303,16 @@ if __name__ == "__main__":
         "--discover", action="store_true", default=False,
         help="Run node mapping discovery and exit"
     )
+    parser.add_argument(
+        "--no-dgem", action="store_true", default=False,
+        help="Disable DGEM gene expression module"
+    )
 
     args = parser.parse_args()
 
-    system = DrugRepurposingSystem()
+    system = DrugRepurposingSystem(
+        enable_dgem=not args.no_dgem,
+    )
 
     if args.discover:
         system.gnn.load_knowledge_graph(split=args.split)

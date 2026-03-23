@@ -22,16 +22,16 @@ st.set_page_config(
 
 # ─── Cache the heavy system initialization ───
 @st.cache_resource
-def load_system(split):
+def load_system(split, enable_dgem=True):
     """Load and cache the system so it persists across Streamlit reruns."""
     from main import DrugRepurposingSystem
-    system = DrugRepurposingSystem()
+    system = DrugRepurposingSystem(enable_dgem=enable_dgem)
     system.setup_gnn(split=split, train=False)
     return system
 
 
 st.title("💊 AI Drug Repurposing System")
-st.caption("TxGNN + GPT-OSS 20B — Predict new uses for existing drugs")
+st.caption("TxGNN + DGEM + GPT-OSS 20B — Predict new uses for existing drugs")
 
 # ─── Sidebar ───
 with st.sidebar:
@@ -40,10 +40,16 @@ with st.sidebar:
     explain_top = st.slider("Drugs to explain in detail", 1, 10, 5)
     split = st.selectbox("Evaluation split", ["random", "complex_disease"])
 
+    st.divider()
+    st.header("DGEM Settings")
+    enable_dgem = st.checkbox("Enable DGEM (Gene Expression)", value=True)
+
     if st.button("Initialize System"):
         with st.spinner("Loading TxGNN Knowledge Graph... "
                        "(first time takes a few minutes)"):
-            st.session_state.system = load_system(split)
+            st.session_state.system = load_system(
+                split, enable_dgem=enable_dgem
+            )
         st.success("System ready!")
 
     st.divider()
@@ -53,8 +59,8 @@ with st.sidebar:
     2. Enter a disease name
     3. Click **Find Repurposing Candidates**
 
-    **Note:** The system must be trained before use.
-    See README.md for training instructions.
+    **DGEM:** Enable gene expression matching for improved
+    scoring. Run `python scripts/setup_dgem.py` first.
     """)
 
 # ─── Main Area ───
@@ -104,26 +110,52 @@ if st.button("Find Repurposing Candidates", type="primary"):
                     if ctx.get("unmet_needs"):
                         st.write(f"**Unmet Needs:** {ctx['unmet_needs']}")
 
-        # Predictions table
-        st.subheader("Drug Candidates (ranked by GNN score)")
-        if results.get("predictions"):
-            for i, pred in enumerate(results["predictions"]):
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    st.write(f"**{i+1}. {pred['drug']}**")
-                with col2:
+        # Predictions tables — separate TxGNN and DGEM rankings
+        has_dgem = bool(results.get("dgem_predictions"))
+
+        if has_dgem:
+            col_gnn, col_dgem = st.columns(2)
+
+            with col_gnn:
+                st.subheader("TxGNN Predictions")
+                st.caption("Ranked by knowledge graph embedding similarity")
+                for i, pred in enumerate(
+                        results.get("txgnn_predictions", [])):
                     score = pred["score"]
-                    if score > 0.7:
-                        color = "green"
-                    elif score > 0.4:
-                        color = "orange"
-                    else:
-                        color = "red"
-                    st.markdown(f":{color}[Score: {score:.4f}]")
+                    color = ("green" if score > 0.7
+                             else "orange" if score > 0.4 else "red")
+                    st.markdown(f"**{i+1}. {pred['drug']}** — "
+                                f":{color}[{score:.4f}]")
+
+            with col_dgem:
+                st.subheader("DGEM Predictions")
+                st.caption("Ranked by gene expression reversal score")
+                dgem_scored = results.get("metadata", {}).get(
+                    "dgem_drugs_scored", 0)
+                st.info(f"Scored {dgem_scored} drugs with expression data")
+                for i, pred in enumerate(results["dgem_predictions"]):
+                    score = pred["score"]
+                    color = ("green" if score > 0.6
+                             else "orange" if score > 0.5 else "red")
+                    st.markdown(f"**{i+1}. {pred['drug']}** — "
+                                f":{color}[{score:.4f}]")
         else:
-            st.info("No GNN predictions available. "
-                    "Ensure the model is trained and disease name mappings "
-                    "are configured.")
+            st.subheader("TxGNN Predictions")
+            if results.get("txgnn_predictions"):
+                for i, pred in enumerate(
+                        results["txgnn_predictions"]):
+                    score = pred["score"]
+                    color = ("green" if score > 0.7
+                             else "orange" if score > 0.4 else "red")
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.write(f"**{i+1}. {pred['drug']}**")
+                    with col2:
+                        st.markdown(f":{color}[Score: {score:.4f}]")
+            else:
+                st.info("No GNN predictions available. "
+                        "Ensure the model is trained and disease name "
+                        "mappings are configured.")
 
         # Explanations
         if results.get("explanations"):

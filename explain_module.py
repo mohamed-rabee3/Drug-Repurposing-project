@@ -83,15 +83,16 @@ class RepurposingExplainer:
             return None
 
     def explain_prediction(self, drug_name, disease_name, gnn_score,
-                            graph_paths=None):
+                            graph_paths=None, dgem_score=None):
         """
-        Generate a complete explanation combining graph paths + NLP.
+        Generate a complete explanation combining graph paths + NLP + DGEM.
 
         Args:
             drug_name: Name of the predicted drug.
             disease_name: Name of the target disease.
             gnn_score: The GNN's confidence score (0-1).
             graph_paths: Optional multi-hop paths from GraphMask.
+            dgem_score: Optional DGEM gene expression reversal score (0-1).
 
         Returns:
             Dict with combined explanation.
@@ -109,6 +110,11 @@ class RepurposingExplainer:
             "graph_paths": graph_paths,
             "biological_explanation": nlp_explanation,
         }
+
+        # Add DGEM evidence if available
+        if dgem_score is not None:
+            explanation["dgem_score"] = dgem_score
+            explanation["dgem_interpretation"] = self._dgem_to_interpretation(dgem_score)
 
         return explanation
 
@@ -133,6 +139,7 @@ class RepurposingExplainer:
                 drug_name=drug_name,
                 disease_name=disease_name,
                 gnn_score=pred["score"],
+                dgem_score=pred.get("dgem_score"),
             )
             explanations.append(expl)
 
@@ -159,6 +166,24 @@ class RepurposingExplainer:
             return "Low - Weak signal, needs more evidence"
         else:
             return "Very Low - Unlikely candidate"
+
+    @staticmethod
+    def _dgem_to_interpretation(dgem_score):
+        """Convert DGEM reversal score to human-readable interpretation."""
+        if dgem_score >= 0.75:
+            return ("Strong reversal - Drug significantly reverses the disease's "
+                    "gene expression signature")
+        elif dgem_score >= 0.60:
+            return ("Moderate reversal - Drug partially reverses disease "
+                    "expression patterns")
+        elif dgem_score >= 0.50:
+            return ("Weak reversal - Slight tendency to reverse disease "
+                    "expression, near neutral")
+        elif dgem_score >= 0.40:
+            return ("Neutral - No clear reversal or similarity in expression")
+        else:
+            return ("Same direction - Drug expression aligns with disease "
+                    "rather than reversing it")
 
 
 if __name__ == "__main__":

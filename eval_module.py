@@ -205,6 +205,135 @@ class RepurposingEvaluator:
         return results
 
 
+    def evaluate_combined(self, y_true, gnn_scores, dgem_scores,
+                           combined_scores):
+        """
+        Compare GNN-only, DGEM-only, and combined performance.
+
+        Args:
+            y_true: Binary labels for all drugs.
+            gnn_scores: GNN-only predicted scores.
+            dgem_scores: DGEM-only predicted scores (may contain NaN/None).
+            combined_scores: Combined predicted scores.
+
+        Returns:
+            Dict with metrics for each method and improvement deltas.
+        """
+        results = {}
+
+        # GNN-only
+        results["gnn_only"] = {
+            "auprc": self.compute_auprc(y_true, gnn_scores),
+        }
+        try:
+            results["gnn_only"]["auroc"] = self.compute_auroc(y_true, gnn_scores)
+        except ValueError:
+            results["gnn_only"]["auroc"] = None
+
+        # DGEM-only (filter to drugs that have DGEM scores)
+        dgem_arr = np.array(dgem_scores, dtype=float)
+        valid_mask = ~np.isnan(dgem_arr)
+        if np.sum(valid_mask) > 0 and np.sum(y_true[valid_mask]) > 0:
+            results["dgem_only"] = {
+                "auprc": self.compute_auprc(y_true[valid_mask], dgem_arr[valid_mask]),
+                "coverage": f"{int(np.sum(valid_mask))}/{len(y_true)}",
+            }
+            try:
+                results["dgem_only"]["auroc"] = self.compute_auroc(
+                    y_true[valid_mask], dgem_arr[valid_mask])
+            except ValueError:
+                results["dgem_only"]["auroc"] = None
+        else:
+            results["dgem_only"] = {"auprc": None, "auroc": None, "coverage": "0"}
+
+        # Combined
+        results["combined"] = {
+            "auprc": self.compute_auprc(y_true, combined_scores),
+        }
+        try:
+            results["combined"]["auroc"] = self.compute_auroc(y_true, combined_scores)
+        except ValueError:
+            results["combined"]["auroc"] = None
+
+        # Improvement deltas
+        gnn_auprc = results["gnn_only"]["auprc"]
+        combined_auprc = results["combined"]["auprc"]
+        results["improvement"] = {
+            "auprc_delta": combined_auprc - gnn_auprc,
+            "auprc_relative": (combined_auprc - gnn_auprc) / gnn_auprc * 100
+            if gnn_auprc > 0 else 0,
+        }
+
+        # Print summary
+        print("\n[EVAL] === COMPARATIVE EVALUATION ===")
+        print(f"    GNN-only AUPRC:  {gnn_auprc:.4f}")
+        if results["dgem_only"]["auprc"] is not None:
+            print(f"    DGEM-only AUPRC: {results['dgem_only']['auprc']:.4f} "
+                  f"(coverage: {results['dgem_only']['coverage']})")
+        print(f"    Combined AUPRC:  {combined_auprc:.4f}")
+        print(f"    Improvement:     {results['improvement']['auprc_delta']:+.4f} "
+              f"({results['improvement']['auprc_relative']:+.1f}%)")
+
+        # Save
+        metrics_path = os.path.join(self.output_folder,
+                                     "comparative_evaluation.json")
+        with open(metrics_path, "w") as f:
+            json.dump(results, f, indent=2, default=str)
+        print(f"[EVAL] Comparative metrics saved to {metrics_path}")
+
+        return results
+
+    def tune_combination_weights(self, y_true, gnn_scores, dgem_scores,
+                                  step=0.05):
+        """
+        Find optimal GNN/DGEM combination weights via grid search.
+
+        Args:
+            y_true: Binary labels.
+            gnn_scores: GNN scores array.
+            dgem_scores: DGEM scores array (may contain NaN).
+            step: Weight increment for grid search.
+
+        Returns:
+            Tuple of (best_dgem_weight, best_auprc).
+        """
+        from dgem_module import combine_scores
+
+        dgem_arr = np.array(dgem_scores, dtype=float)
+
+        best_auprc = 0
+        best_w = 0.0
+        results_grid = []
+
+        for w_dgem_int in range(0, int(1.0 / step) + 1):
+            w_dgem = w_dgem_int * step
+            w_gnn = 1.0 - w_dgem
+
+            combined = np.array([
+                combine_scores(g, d if not np.isnan(d) else None,
+                              w_gnn=w_gnn, w_dgem=w_dgem)
+                for g, d in zip(gnn_scores, dgem_arr)
+            ])
+
+            auprc = self.compute_auprc(y_true, combined)
+            results_grid.append({"dgem_weight": w_dgem, "auprc": auprc})
+
+            if auprc > best_auprc:
+                best_auprc = auprc
+                best_w = w_dgem
+
+        print(f"\n[EVAL] Weight tuning results:")
+        print(f"    Best DGEM weight: {best_w:.2f} (GNN weight: {1-best_w:.2f})")
+        print(f"    Best AUPRC: {best_auprc:.4f}")
+
+        # Save full grid
+        grid_path = os.path.join(self.output_folder, "weight_tuning_grid.json")
+        with open(grid_path, "w") as f:
+            json.dump(results_grid, f, indent=2)
+
+        return best_w, best_auprc
+
+
 if __name__ == "__main__":
     print("Evaluation module ready. Use with a trained TxGNN model.")
     print("\nExample with synthetic data:")

@@ -48,6 +48,7 @@ class DrugRepurposingGNN:
         self.tx_eval = None
         self.is_trained = False
         self._disease_names = {}  # idx -> name mapping
+        self._drug_ids = {}       # idx -> DrugBank ID mapping (for DGEM)
         self._drug_names = {}     # idx -> name mapping
 
         for d in (data_folder, model_folder):
@@ -350,6 +351,7 @@ class DrugRepurposingGNN:
         """
         self._disease_names = {}
         self._drug_names = {}
+        self._drug_ids = {}
 
         try:
             nodes_file = os.path.join(self.data_folder, "node.csv")
@@ -373,9 +375,11 @@ class DrugRepurposingGNN:
             drugs = df[df['node_type'] == 'drug'].sort_values('node_index')
             for per_type_idx, (_, row) in enumerate(drugs.iterrows()):
                 self._drug_names[per_type_idx] = row['node_name']
+                self._drug_ids[per_type_idx] = row['node_id']
 
             print(f"[GNN] Loaded {len(self._disease_names)} disease names, "
-                  f"{len(self._drug_names)} drug names")
+                  f"{len(self._drug_names)} drug names, "
+                  f"{len(self._drug_ids)} drug IDs")
 
         except Exception as e:
             print(f"[GNN] WARNING: Failed to load node names: {e}")
@@ -442,6 +446,18 @@ class DrugRepurposingGNN:
             return list(self._drug_names.values())
         print("[GNN] No drug names loaded. Run discover_node_mappings() first.")
         return []
+
+    def get_drug_id(self, drug_idx):
+        """
+        Get the DrugBank ID for a drug by its per-type index.
+
+        Args:
+            drug_idx: Per-type drug index in the DGL graph.
+
+        Returns:
+            DrugBank ID string (e.g., "DB00605") or None.
+        """
+        return self._drug_ids.get(drug_idx)
 
 
 # ─────────────────────────────────────────────────────────────
