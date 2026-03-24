@@ -22,45 +22,51 @@ st.set_page_config(
 
 # ─── Cache the heavy system initialization ───
 @st.cache_resource
-def load_system(split, enable_dgem=True):
+def load_system(split, enable_dgem, enable_pathway,
+                enable_proximity, enable_literature):
     """Load and cache the system so it persists across Streamlit reruns."""
     from main import DrugRepurposingSystem
-    system = DrugRepurposingSystem(enable_dgem=enable_dgem)
+    system = DrugRepurposingSystem(
+        enable_dgem=enable_dgem,
+        enable_pathway=enable_pathway,
+        enable_proximity=enable_proximity,
+        enable_literature=enable_literature,
+    )
     system.setup_gnn(split=split, train=False)
     return system
 
 
 st.title("💊 AI Drug Repurposing System")
-st.caption("TxGNN + DGEM + GPT-OSS 20B — Predict new uses for existing drugs")
+st.caption("TxGNN + DGEM + Pathway + Proximity + Literature")
 
 # ─── Sidebar ───
 with st.sidebar:
     st.header("Settings")
     top_k = st.slider("Number of drug candidates", 5, 50, 20)
-    explain_top = st.slider("Drugs to explain in detail", 1, 10, 5)
+    explain_top = st.slider("Drugs to explain in detail", 0, 10, 5)
     split = st.selectbox("Evaluation split", ["random", "complex_disease"])
 
     st.divider()
-    st.header("DGEM Settings")
-    enable_dgem = st.checkbox("Enable DGEM (Gene Expression)", value=True)
+    st.header("Scoring Modules")
+    enable_dgem = st.checkbox("DGEM (Gene Expression)", value=True)
+    enable_pathway = st.checkbox("Pathway Enrichment", value=True)
+    enable_proximity = st.checkbox("Network Proximity", value=True)
+    enable_literature = st.checkbox("Literature Mining", value=True)
 
     if st.button("Initialize System"):
         with st.spinner("Loading TxGNN Knowledge Graph... "
                        "(first time takes a few minutes)"):
             st.session_state.system = load_system(
-                split, enable_dgem=enable_dgem
+                split, enable_dgem, enable_pathway,
+                enable_proximity, enable_literature
             )
         st.success("System ready!")
 
     st.divider()
     st.markdown("""
-    **How to use:**
-    1. Click **Initialize System** (first time loads ~1.5GB KG data)
-    2. Enter a disease name
-    3. Click **Find Repurposing Candidates**
-
-    **DGEM:** Enable gene expression matching for improved
-    scoring. Run `python scripts/setup_dgem.py` first.
+    **Setup:**
+    - `python scripts/setup_dgem.py` (DGEM data)
+    - `python scripts/setup_network.py` (Pathway + Proximity data)
     """)
 
 # ─── Main Area ───
@@ -71,7 +77,7 @@ disease_input = st.text_input(
 
 if st.button("Find Repurposing Candidates", type="primary"):
     if "system" not in st.session_state:
-        st.error("Initialize the system first (click the button in the sidebar).")
+        st.error("Initialize the system first (sidebar button).")
     elif not disease_input:
         st.warning("Please enter a disease name.")
     else:
@@ -104,58 +110,56 @@ if st.button("Find Repurposing Candidates", type="primary"):
                     if ctx.get("key_targets"):
                         st.write(f"**Key Targets:** "
                                  f"{', '.join(ctx['key_targets'])}")
-                    if ctx.get("current_treatments"):
-                        st.write(f"**Current Treatments:** "
-                                 f"{', '.join(ctx['current_treatments'])}")
-                    if ctx.get("unmet_needs"):
-                        st.write(f"**Unmet Needs:** {ctx['unmet_needs']}")
 
-        # Predictions tables — separate TxGNN and DGEM rankings
-        has_dgem = bool(results.get("dgem_predictions"))
+        # Build tabs for each module that has results
+        tab_names = []
+        tab_data = []
 
-        if has_dgem:
-            col_gnn, col_dgem = st.columns(2)
+        module_configs = [
+            ("TxGNN", "txgnn_predictions",
+             "Knowledge graph embedding similarity"),
+            ("DGEM", "dgem_predictions",
+             "Gene expression reversal score"),
+            ("Pathway", "pathway_predictions",
+             "Pathway enrichment (Fisher's exact test)"),
+            ("Proximity", "proximity_predictions",
+             "PPI network distance"),
+            ("Literature", "literature_predictions",
+             "PubMed co-occurrence + LLM relevance"),
+        ]
 
-            with col_gnn:
-                st.subheader("TxGNN Predictions")
-                st.caption("Ranked by knowledge graph embedding similarity")
-                for i, pred in enumerate(
-                        results.get("txgnn_predictions", [])):
-                    score = pred["score"]
-                    color = ("green" if score > 0.7
-                             else "orange" if score > 0.4 else "red")
-                    st.markdown(f"**{i+1}. {pred['drug']}** — "
-                                f":{color}[{score:.4f}]")
+        for name, key, desc in module_configs:
+            preds = results.get(key, [])
+            if preds:
+                tab_names.append(name)
+                tab_data.append((preds, desc, key))
 
-            with col_dgem:
-                st.subheader("DGEM Predictions")
-                st.caption("Ranked by gene expression reversal score")
-                dgem_scored = results.get("metadata", {}).get(
-                    "dgem_drugs_scored", 0)
-                st.info(f"Scored {dgem_scored} drugs with expression data")
-                for i, pred in enumerate(results["dgem_predictions"]):
-                    score = pred["score"]
-                    color = ("green" if score > 0.6
-                             else "orange" if score > 0.5 else "red")
-                    st.markdown(f"**{i+1}. {pred['drug']}** — "
-                                f":{color}[{score:.4f}]")
+        if tab_names:
+            tabs = st.tabs(tab_names)
+            for tab, (preds, desc, key) in zip(tabs, tab_data):
+                with tab:
+                    st.caption(desc)
+                    meta = results.get("metadata", {})
+                    scored_key = key.replace("_predictions",
+                                            "_drugs_scored")
+                    scored = meta.get(scored_key, 0)
+                    if scored:
+                        st.info(f"Scored {scored} drugs")
+
+                    for i, pred in enumerate(preds):
+                        score = pred["score"]
+                        color = ("green" if score > 0.7
+                                 else "orange" if score > 0.4
+                                 else "red")
+                        extra = ""
+                        if "pubmed_count" in pred:
+                            extra = f" ({pred['pubmed_count']} papers)"
+                        st.markdown(
+                            f"**{i+1}. {pred['drug']}** — "
+                            f":{color}[{score:.4f}]{extra}"
+                        )
         else:
-            st.subheader("TxGNN Predictions")
-            if results.get("txgnn_predictions"):
-                for i, pred in enumerate(
-                        results["txgnn_predictions"]):
-                    score = pred["score"]
-                    color = ("green" if score > 0.7
-                             else "orange" if score > 0.4 else "red")
-                    col1, col2 = st.columns([3, 1])
-                    with col1:
-                        st.write(f"**{i+1}. {pred['drug']}**")
-                    with col2:
-                        st.markdown(f":{color}[Score: {score:.4f}]")
-            else:
-                st.info("No GNN predictions available. "
-                        "Ensure the model is trained and disease name "
-                        "mappings are configured.")
+            st.info("No predictions available.")
 
         # Explanations
         if results.get("explanations"):
@@ -169,14 +173,9 @@ if st.button("Find Repurposing Candidates", type="primary"):
                                  f"{expl.get('mechanism_of_action', 'N/A')}")
                         st.write(f"**Pathway:** "
                                  f"{expl.get('biological_pathway', 'N/A')}")
-                        st.write(f"**Evidence:** "
-                                 f"{expl.get('evidence_strength', 'N/A')}")
                         if expl.get("target_proteins"):
                             st.write(f"**Target Proteins:** "
                                      f"{', '.join(expl['target_proteins'])}")
-                        if expl.get("safety_considerations"):
-                            st.write(f"**Safety:** "
-                                     f"{expl['safety_considerations']}")
                     else:
                         st.write(str(expl))
 

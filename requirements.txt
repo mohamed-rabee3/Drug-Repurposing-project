@@ -36,3 +36,6 @@ torchdata==0.7.1
 # DGEM (Drug-Gene Expression Matching) module
 scipy
 GEOparse
+
+# Pathway + Proximity modules
+networkx

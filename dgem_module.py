@@ -209,6 +209,10 @@ class DGEMScorer:
           - r =  0 (no relationship)  -> score = 0.5
           - r = +1 (same direction)   -> score = 0.0
 
+        For sparse disease signatures (>90% zeros), computes correlation
+        using only the non-zero gene positions to avoid diluting the signal
+        with uninformative zeros.
+
         Args:
             drug_profile: numpy array of drug-induced expression values.
             disease_signature: numpy array of disease expression values.
@@ -231,8 +235,23 @@ class DGEMScorer:
         if np.std(dp) < 1e-10 or np.std(ds) < 1e-10:
             return 0.5  # No information -> neutral score
 
-        # Pearson correlation
-        pearson_r = np.corrcoef(dp, ds)[0, 1]
+        # Sparse-aware scoring: if disease signature is very sparse,
+        # use only the non-zero gene positions for correlation
+        nonzero_mask = ds != 0
+        sparsity = 1.0 - (np.count_nonzero(ds) / len(ds))
+
+        if sparsity > 0.90 and np.sum(nonzero_mask) >= 10:
+            # Focus on genes with known disease expression changes
+            dp_focused = dp[nonzero_mask]
+            ds_focused = ds[nonzero_mask]
+
+            if np.std(dp_focused) < 1e-10 or np.std(ds_focused) < 1e-10:
+                return 0.5
+
+            pearson_r = np.corrcoef(dp_focused, ds_focused)[0, 1]
+        else:
+            # Standard full-vector correlation
+            pearson_r = np.corrcoef(dp, ds)[0, 1]
 
         if np.isnan(pearson_r):
             return 0.5

@@ -800,6 +800,292 @@ def coverage_report():
 
 
 # ─────────────────────────────────────────────────────────────
+# Step 7: Enrich sparse disease signatures by reprocessing GEO
+# ─────────────────────────────────────────────────────────────
+
+
+def enrich_sparse_signatures(sparsity_threshold=0.90):
+    """
+    Enrich disease signatures that are too sparse by reprocessing their
+    source GEO microarray data through the GPL platform annotation.
+
+    CREEDS signatures are built from pre-computed DEGs (up/down gene lists),
+    but most DEGs don't overlap with L1000 landmark genes. By going back to
+    the raw GEO microarray data (which has expression values for ALL genes
+    including L1000 genes), we can build much denser L1000-aligned signatures.
+
+    Requires: pip install GEOparse
+
+    Args:
+        sparsity_threshold: Signatures with more zeros than this are enriched.
+    """
+    sigs_path = os.path.join(DGEM_FOLDER, "disease_signatures.pkl")
+    genes_path = os.path.join(DGEM_FOLDER, "l1000_genes.json")
+    raw_path = os.path.join(DGEM_FOLDER, "creeds_raw.json")
+
+    if not os.path.exists(sigs_path) or not os.path.exists(genes_path):
+        print("[STEP 7] Skipping enrichment: signatures or gene list not found.")
+        return False
+
+    try:
+        import GEOparse
+        import pandas as pd
+    except ImportError:
+        print("[STEP 7] GEOparse not installed. Install with: pip install GEOparse")
+        print("[STEP 7] Skipping GEO enrichment.")
+        return True
+
+    with open(sigs_path, "rb") as f:
+        disease_sigs = pickle.load(f)
+    with open(genes_path, "r") as f:
+        l1000_genes = json.load(f)
+
+    l1000_set = set(l1000_genes)
+    gene_to_idx = {g: i for i, g in enumerate(l1000_genes)}
+
+    # Identify sparse signatures
+    sparse_diseases = []
+    for disease_name, sig_data in disease_sigs.items():
+        vector = sig_data.get("vector")
+        if isinstance(vector, np.ndarray):
+            nonzero = np.count_nonzero(vector)
+            sparsity = 1.0 - (nonzero / len(vector))
+            if sparsity > sparsity_threshold:
+                sparse_diseases.append((disease_name, nonzero, sparsity))
+
+    if not sparse_diseases:
+        print("[STEP 7] No sparse disease signatures found.")
+        return True
+
+    print(f"[STEP 7] Found {len(sparse_diseases)} sparse disease signatures "
+          f"(>{sparsity_threshold*100:.0f}% zeros)")
+
+    # Load CREEDS raw data to get GEO IDs for each disease
+    if not os.path.exists(raw_path):
+        print("[STEP 7] CREEDS raw data not found. Cannot enrich.")
+        return False
+
+    with open(raw_path, "r", encoding="utf-8") as f:
+        creeds_data = json.load(f)
+
+    # Map disease names to their GEO datasets
+    disease_to_geo = {}
+    for sig in creeds_data:
+        if sig.get("organism", "").lower() != "human":
+            continue
+        dname = sig.get("disease_name", "").strip().lower()
+        geo_id = sig.get("geo_id", "")
+        if dname and geo_id:
+            if dname not in disease_to_geo:
+                disease_to_geo[dname] = set()
+            disease_to_geo[dname].add(geo_id)
+
+    enriched_count = 0
+    # Process each sparse disease
+    for disease_name, old_nonzero, sparsity in sparse_diseases:
+        geo_ids = disease_to_geo.get(disease_name, set())
+        if not geo_ids:
+            continue
+
+        # Get all CREEDS entries for this disease to identify sample groups
+        disease_entries = [
+            s for s in creeds_data
+            if s.get("disease_name", "").strip().lower() == disease_name
+            and s.get("organism", "").lower() == "human"
+        ]
+
+        new_nonzero = _reprocess_geo_for_disease(
+            disease_name, geo_ids, disease_entries, disease_sigs,
+            l1000_genes, l1000_set, gene_to_idx
+        )
+
+        if new_nonzero is not None and new_nonzero > old_nonzero:
+            enriched_count += 1
+            print(f"[STEP 7] '{disease_name}': {old_nonzero} -> {new_nonzero} "
+                  f"non-zero L1000 genes")
+
+    if enriched_count > 0:
+        with open(sigs_path, "wb") as f:
+            pickle.dump(disease_sigs, f, protocol=4)
+        print(f"\n[STEP 7] Enriched {enriched_count} disease signatures. Saved.")
+    else:
+        print("\n[STEP 7] No signatures could be enriched from GEO source data.")
+
+    return True
+
+
+def _reprocess_geo_for_disease(disease_name, geo_ids, creeds_entries,
+                                disease_sigs, l1000_genes, l1000_set, gene_to_idx):
+    """
+    Reprocess GEO microarray data for a disease to build a denser L1000 signature.
+
+    Instead of using only CREEDS pre-computed DEGs (which may not overlap L1000),
+    this downloads the full GEO dataset, maps probes to genes via the GPL platform
+    annotation, and computes fold changes for ALL L1000 genes.
+
+    Returns:
+        New non-zero gene count, or None on failure.
+    """
+    import GEOparse
+    import pandas as pd
+
+    for geo_id in geo_ids:
+        try:
+            print(f"[STEP 7] Fetching {geo_id} for '{disease_name}'...")
+            gse = GEOparse.get_GEO(geo=geo_id, destdir=DEEPCE_RAW, silent=True)
+
+            if not gse.gpls:
+                print(f"    {geo_id}: No platform annotation (RNA-seq?). Skipping.")
+                continue
+
+            # Get platform annotation for probe -> gene symbol mapping
+            gpl_name = list(gse.gpls.keys())[0]
+            gpl = gse.gpls[gpl_name]
+
+            # Find the gene symbol column in GPL
+            gene_col = None
+            for col in gpl.table.columns:
+                if col.upper() in ("GENE_SYMBOL", "GENE SYMBOL", "SYMBOL",
+                                   "Gene Symbol", "Gene_Symbol"):
+                    gene_col = col
+                    break
+            if gene_col is None:
+                for col in gpl.table.columns:
+                    if "gene_symbol" in col.lower() or "symbol" in col.lower():
+                        gene_col = col
+                        break
+
+            if gene_col is None:
+                print(f"    {geo_id}: No gene symbol column in {gpl_name}. Skipping.")
+                continue
+
+            # Build probe ID -> gene symbol mapping
+            # Probe IDs can be numeric (Agilent) or strings (Affymetrix)
+            # Gene symbols may contain multiple genes (e.g. "DDR1 /// MIR4640")
+            probe_to_gene = {}
+            for _, row in gpl.table.iterrows():
+                gs = row.get(gene_col)
+                if pd.notna(gs) and str(gs).strip():
+                    # Take first gene if multiple (separated by ///)
+                    symbol = str(gs).split("///")[0].strip()
+                    if symbol:
+                        probe_to_gene[str(row["ID"]).strip()] = symbol
+
+            l1000_probes = sum(1 for g in probe_to_gene.values() if g in l1000_set)
+            print(f"    {geo_id}: {len(probe_to_gene)} probes with genes, "
+                  f"{l1000_probes} map to L1000")
+
+            if l1000_probes < 50:
+                print(f"    {geo_id}: Too few L1000 probes. Skipping.")
+                continue
+
+            # Classify samples into disease vs control from titles
+            disease_samples = []
+            control_samples = []
+            disease_keywords = _get_disease_keywords(disease_name)
+
+            for gsm_name, gsm in gse.gsms.items():
+                title = gsm.metadata.get("title", [""])[0].lower()
+                source = gsm.metadata.get("source_name_ch1", [""])[0].lower()
+                chars = " ".join(gsm.metadata.get("characteristics_ch1", [])).lower()
+                combined = f"{title} {source} {chars}"
+
+                is_disease = any(kw in combined for kw in disease_keywords)
+                is_control = any(kw in combined for kw in
+                               ["control", "normal", "healthy", "unaffected",
+                                "wild type", "wild-type", "wildtype", "wt "])
+
+                if is_disease and not is_control:
+                    disease_samples.append(gsm_name)
+                elif is_control and not is_disease:
+                    control_samples.append(gsm_name)
+
+            if not disease_samples or not control_samples:
+                print(f"    {geo_id}: Could not identify disease/control groups "
+                      f"(disease={len(disease_samples)}, control={len(control_samples)})")
+                continue
+
+            print(f"    {geo_id}: {len(disease_samples)} disease, "
+                  f"{len(control_samples)} control samples")
+
+            # Collect L1000 gene expression values per group
+            disease_vals = {g: [] for g in l1000_genes}
+            control_vals = {g: [] for g in l1000_genes}
+
+            for group_samples, group_vals in [
+                (disease_samples, disease_vals),
+                (control_samples, control_vals)
+            ]:
+                for gsm_name in group_samples:
+                    table = gse.gsms[gsm_name].table
+                    if table is None or len(table) == 0:
+                        continue
+                    for _, row in table.iterrows():
+                        pid = str(row["ID_REF"]).strip()
+                        # Handle numeric IDs stored as floats (e.g. 3.0 -> "3")
+                        if pid.endswith(".0"):
+                            pid = pid[:-2]
+                        if pid in probe_to_gene:
+                            gene = probe_to_gene[pid]
+                            if gene in l1000_set and pd.notna(row.get("VALUE")):
+                                try:
+                                    group_vals[gene].append(float(row["VALUE"]))
+                                except (ValueError, TypeError):
+                                    pass
+
+            # Compute fold changes for L1000 genes
+            new_vector = np.zeros(len(l1000_genes), dtype=np.float32)
+            genes_filled = 0
+            for gene in l1000_genes:
+                if disease_vals[gene] and control_vals[gene]:
+                    d_mean = np.mean(disease_vals[gene])
+                    c_mean = np.mean(control_vals[gene])
+                    fc = d_mean - c_mean  # log-scale values
+                    new_vector[gene_to_idx[gene]] = fc
+                    genes_filled += 1
+
+            new_nonzero = np.count_nonzero(new_vector)
+            old_nonzero = np.count_nonzero(disease_sigs[disease_name]["vector"])
+
+            if new_nonzero > old_nonzero:
+                disease_sigs[disease_name]["vector"] = new_vector
+                disease_sigs[disease_name]["avg_l1000_matched"] = genes_filled
+                return new_nonzero
+            else:
+                print(f"    {geo_id}: Reprocessed ({new_nonzero} genes) not better "
+                      f"than existing ({old_nonzero})")
+
+        except Exception as e:
+            print(f"    {geo_id}: Error: {e}")
+
+    return None
+
+
+def _get_disease_keywords(disease_name):
+    """Get keywords to identify disease samples in GEO metadata."""
+    keywords = [disease_name]
+
+    # Add common abbreviations/aliases
+    aliases = {
+        "fragile x syndrome": ["fmr1", "fragile x", "fxs", "fmr1-fm"],
+        "alzheimer's disease": ["alzheimer", "ad brain"],
+        "parkinson's disease": ["parkinson", "pd brain"],
+        "breast cancer": ["breast tumor", "breast carcinoma"],
+        "type 2 diabetes mellitus": ["t2d", "type 2 diabetes", "diabetic"],
+    }
+
+    extra = aliases.get(disease_name, [])
+    keywords.extend(extra)
+
+    # Also add words from the disease name
+    words = disease_name.split()
+    if len(words) >= 2:
+        keywords.append(" ".join(words[:2]))
+
+    return keywords
+
+
+# ─────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────
 
@@ -835,7 +1121,12 @@ def main():
     if step3b_ok and step4_ok:
         step5_ok = build_disease_mapping()
 
-    # Step 6: Coverage report
+    # Step 7: Enrich sparse signatures
+    step7_ok = False
+    if step3b_ok:
+        step7_ok = enrich_sparse_signatures()
+
+    # Step 8: Coverage report
     coverage_report()
 
     # Summary
@@ -849,6 +1140,7 @@ def main():
         ("CREEDS processing", step3b_ok),
         ("Drug ID mapping", step4_ok),
         ("Disease name mapping", step5_ok),
+        ("Sparse signature enrichment", step7_ok),
     ]
     all_ok = True
     for name, ok in steps:
