@@ -11,6 +11,10 @@ import torch_cuda_ld_path
 
 torch_cuda_ld_path.apply()
 
+import txgnn_pandas_patch
+
+txgnn_pandas_patch.apply()
+
 import os
 import sys
 import torch
@@ -19,6 +23,10 @@ import json
 import numpy as np
 import pandas as pd
 from txgnn import TxData, TxGNN, TxEval
+
+import dgl_dataloader_compat
+
+dgl_dataloader_compat.apply()
 
 
 class DrugRepurposingGNN:

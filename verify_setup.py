@@ -4,6 +4,10 @@ import torch_cuda_ld_path
 
 torch_cuda_ld_path.apply()
 
+import txgnn_pandas_patch
+
+txgnn_pandas_patch.apply()
+
 import sys
 
 print("=" * 60)

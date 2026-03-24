@@ -11,6 +11,7 @@ torch_cuda_ld_path.apply()
 import streamlit as st
 import json
 import os
+import pandas as pd
 
 # ─── Page Config ───
 st.set_page_config(
@@ -69,10 +70,28 @@ with st.sidebar:
     - `python scripts/setup_network.py` (Pathway + Proximity data)
     """)
 
+# ─── Load disease names for autocomplete ───
+@st.cache_data
+def load_disease_names(data_folder="./data"):
+    """Load all disease names from node.csv for autocomplete."""
+    nodes_file = os.path.join(data_folder, "node.csv")
+    if not os.path.exists(nodes_file):
+        return []
+    df = pd.read_csv(nodes_file, sep='\t', on_bad_lines='skip')
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = df[col].str.strip('"')
+    diseases = df[df['node_type'] == 'disease']['node_name'].dropna().tolist()
+    return sorted(set(diseases))
+
+disease_list = load_disease_names()
+
 # ─── Main Area ───
-disease_input = st.text_input(
+disease_input = st.selectbox(
     "Enter a disease name:",
-    placeholder="e.g., Alzheimer disease, type 2 diabetes, breast cancer"
+    options=[""] + disease_list,
+    index=0,
+    placeholder="Type to search... e.g., Alzheimer, fragile x, diabetes",
 )
 
 if st.button("Find Repurposing Candidates", type="primary"):
@@ -111,15 +130,55 @@ if st.button("Find Repurposing Candidates", type="primary"):
                         st.write(f"**Key Targets:** "
                                  f"{', '.join(ctx['key_targets'])}")
 
-        # Build tabs for each module that has results
-        tab_names = []
-        tab_data = []
+        # ── TxGNN & DGEM side by side ──
+        txgnn_preds = results.get("txgnn_predictions", [])
+        dgem_preds = results.get("dgem_predictions", [])
 
-        module_configs = [
-            ("TxGNN", "txgnn_predictions",
-             "Knowledge graph embedding similarity"),
-            ("DGEM", "dgem_predictions",
-             "Gene expression reversal score"),
+        if txgnn_preds or dgem_preds:
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.subheader("TxGNN Predictions")
+                st.caption("Knowledge graph embedding similarity")
+                meta = results.get("metadata", {})
+                if txgnn_preds:
+                    for i, pred in enumerate(txgnn_preds):
+                        score = pred["score"]
+                        pct = score * 100
+                        color = ("green" if score > 0.7
+                                 else "orange" if score > 0.4
+                                 else "red")
+                        st.markdown(
+                            f"**{i+1}. {pred['drug']}** — "
+                            f":{color}[{pct:.0f}%]"
+                        )
+                else:
+                    st.info("No TxGNN predictions.")
+
+            with col2:
+                st.subheader("DGEM Predictions")
+                st.caption("Gene expression reversal score")
+                scored = meta.get("dgem_drugs_scored", 0)
+                if scored:
+                    st.info(f"Scored {scored} drugs")
+                if dgem_preds:
+                    for i, pred in enumerate(dgem_preds):
+                        score = pred["score"]
+                        pct = score * 100
+                        color = ("green" if score > 0.7
+                                 else "orange" if score > 0.4
+                                 else "red")
+                        st.markdown(
+                            f"**{i+1}. {pred['drug']}** — "
+                            f":{color}[{pct:.0f}%]"
+                        )
+                else:
+                    st.info("No DGEM predictions.")
+        else:
+            st.info("No predictions available.")
+
+        # ── Other modules in tabs ──
+        other_modules = [
             ("Pathway", "pathway_predictions",
              "Pathway enrichment (Fisher's exact test)"),
             ("Proximity", "proximity_predictions",
@@ -128,15 +187,19 @@ if st.button("Find Repurposing Candidates", type="primary"):
              "PubMed co-occurrence + LLM relevance"),
         ]
 
-        for name, key, desc in module_configs:
+        other_tab_names = []
+        other_tab_data = []
+        for name, key, desc in other_modules:
             preds = results.get(key, [])
             if preds:
-                tab_names.append(name)
-                tab_data.append((preds, desc, key))
+                other_tab_names.append(name)
+                other_tab_data.append((preds, desc, key))
 
-        if tab_names:
-            tabs = st.tabs(tab_names)
-            for tab, (preds, desc, key) in zip(tabs, tab_data):
+        if other_tab_names:
+            st.divider()
+            st.subheader("Other Scoring Modules")
+            tabs = st.tabs(other_tab_names)
+            for tab, (preds, desc, key) in zip(tabs, other_tab_data):
                 with tab:
                     st.caption(desc)
                     meta = results.get("metadata", {})
@@ -148,6 +211,7 @@ if st.button("Find Repurposing Candidates", type="primary"):
 
                     for i, pred in enumerate(preds):
                         score = pred["score"]
+                        pct = score * 100
                         color = ("green" if score > 0.7
                                  else "orange" if score > 0.4
                                  else "red")
@@ -156,16 +220,24 @@ if st.button("Find Repurposing Candidates", type="primary"):
                             extra = f" ({pred['pubmed_count']} papers)"
                         st.markdown(
                             f"**{i+1}. {pred['drug']}** — "
-                            f":{color}[{score:.4f}]{extra}"
+                            f":{color}[{pct:.0f}%]{extra}"
                         )
-        else:
-            st.info("No predictions available.")
 
         # Explanations
         if results.get("explanations"):
-            st.subheader("Biological Explanations")
+            st.divider()
+            st.subheader("Biological Explanations (TxGNN + DGEM Top Candidates)")
+            # Build source labels
+            txgnn_drugs = {p["drug"].lower() for p in txgnn_preds[:5]}
+            dgem_drugs_set = {p["drug"].lower() for p in dgem_preds[:5]}
             for drug, expl in results["explanations"].items():
-                with st.expander(f"📋 {drug}"):
+                sources = []
+                if drug.lower() in txgnn_drugs:
+                    sources.append("TxGNN")
+                if drug.lower() in dgem_drugs_set:
+                    sources.append("DGEM")
+                label = f" [{', '.join(sources)}]" if sources else ""
+                with st.expander(f"📋 {drug}{label}"):
                     if isinstance(expl, dict):
                         st.write(f"**Summary:** "
                                  f"{expl.get('summary', 'N/A')}")

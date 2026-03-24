@@ -8,6 +8,10 @@ import torch_cuda_ld_path
 
 torch_cuda_ld_path.apply()
 
+import txgnn_pandas_patch
+
+txgnn_pandas_patch.apply()
+
 import numpy as np
 from sklearn.metrics import (
     average_precision_score,

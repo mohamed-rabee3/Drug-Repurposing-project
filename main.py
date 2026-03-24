@@ -297,15 +297,23 @@ class DrugRepurposingSystem:
                         entry["pubmed_count"] = info.get("count", 0)
                         literature_predictions.append(entry)
 
-        # Step: Explain top predictions
+        # Step: Explain top predictions (TxGNN + DGEM top 5)
         if explain_top > 0:
             step += 1
             print(f"\n[Step {step}/{n_steps}] Explaining top {explain_top} "
                   "candidates with GPT-OSS 20B...")
-            drug_names = [p["drug"] for p in gnn_predictions[:explain_top]]
+            # Collect unique drug names from TxGNN and DGEM top-5
+            explain_drugs = []
+            seen = set()
+            for pred_list in [gnn_predictions, dgem_predictions]:
+                for p in pred_list[:explain_top]:
+                    name = p["drug"]
+                    if name.lower() not in seen:
+                        seen.add(name.lower())
+                        explain_drugs.append(name)
             explanations = (
-                self.nlp.batch_explain(disease_name, drug_names)
-                if drug_names else {}
+                self.nlp.batch_explain(disease_name, explain_drugs)
+                if explain_drugs else {}
             )
         else:
             explanations = {}
