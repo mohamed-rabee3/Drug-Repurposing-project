@@ -17,6 +17,12 @@ st.set_page_config(
     layout="wide"
 )
 
+_SIDEBAR_LOGO = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "assets",
+    "faculty_pharmacy_cairo_logo.png",
+)
+
 
 # ─── Cache the heavy system initialization ───
 @st.cache_resource(show_spinner=False)
@@ -199,6 +205,8 @@ st.caption("DGEM + Pathway + Proximity + Literature")
 
 # ─── Sidebar ───
 with st.sidebar:
+    if os.path.isfile(_SIDEBAR_LOGO):
+        st.image(_SIDEBAR_LOGO, use_container_width=True)
     st.header("Settings")
     top_k = st.slider("Number of drug candidates", 1, 20, 10)
     explain_top = st.slider(
@@ -307,12 +315,16 @@ disease_list = st.session_state["disease_list"]
 def _render_scoring_tabs(results):
     """Render Pathway / Proximity prediction tabs."""
     other_modules = [
-        ("Pathway scorer", "pathway_predictions",
-         "Pathway enrichment — top list scaled to 40-74% "
-         "(score_raw in JSON)"),
-        ("Shortest path - Network proximity", "proximity_predictions",
-         "PPI network distance — top list scaled to 40-80% "
-         "(score_raw in JSON)"),
+        (
+            "Pathway scorer",
+            "pathway_predictions",
+            "Pathway-based scores for each candidate drug.",
+        ),
+        (
+            "Shortest path - Network proximity",
+            "proximity_predictions",
+            "Target proximity and shortest-path distance in the network.",
+        ),
     ]
 
     other_tab_names = []
@@ -363,7 +375,7 @@ def _render_scoring_tabs(results):
 
                 if key == "literature_predictions":
                     extra_parts = []
-                    if pred.get("pubmed_count"):
+                    if "pubmed_count" in pred:
                         extra_parts.append(
                             f"{pred['pubmed_count']} papers"
                         )
@@ -449,7 +461,9 @@ with tab_repurpose:
 
                 with col1:
                     st.subheader("Literature mining (40% for the number + 60% for the quality)")
-                    st.caption("PubMed co-occurrence + LLM relevance")
+                    # st.caption(
+
+                    # )
                     if lit_preds:
                         for i, pred in enumerate(lit_preds):
                             score = pred["score"]
@@ -459,7 +473,7 @@ with tab_repurpose:
                                      else "red")
                             detail = ""
                             extra_parts = []
-                            if pred.get("pubmed_count"):
+                            if "pubmed_count" in pred:
                                 extra_parts.append(
                                     f"{pred['pubmed_count']} papers"
                                 )

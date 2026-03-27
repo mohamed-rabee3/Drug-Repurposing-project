@@ -263,6 +263,11 @@ class BiomedicalNLP:
                 lines.append(
                     f"  {i+1}. {drug} (DGEM raw reversal score 0-1: {s:.3f})"
                 )
+            elif "score_raw" in d:
+                s = float(d["score_raw"])
+                lines.append(
+                    f"  {i+1}. {drug} (raw score 0-1: {s:.3f})"
+                )
             else:
                 s = float(d.get("score", 0))
                 label = (

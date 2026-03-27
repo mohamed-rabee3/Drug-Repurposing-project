@@ -19,6 +19,114 @@ PATHWAY_DISPLAY_MAX = 0.74
 PROXIMITY_DISPLAY_MIN = 0.40
 PROXIMITY_DISPLAY_MAX = 0.80
 
+# Literature: union up to this many from each module's full rank; output top N.
+LITERATURE_CANDIDATE_K = 50
+LITERATURE_TOP_K = 10
+# PubMed articles scanned when no graph/pathway/proximity candidates exist.
+LITERATURE_MAX_ARTICLES = 200
+# Always merged into the literature scoring list if missing. PubMed discovery
+# often under-ranks lipids (indexed as metabolites, not with drug MeSH flags).
+LITERATURE_ENSURE_DRUGS = ["cholesterol"]
+# Display order tweaks: each (anchor, follower) moves follower to sit
+# immediately after anchor (scores unchanged). Case-insensitive drug names.
+LITERATURE_ORDER_AFTER = [("zinc", "sulindac")]
+
+
+def _literature_apply_order_after(sorted_pairs, rules):
+    """
+    Reorder [(drug, score), ...] so each follower sits right after its anchor.
+
+    Operates on a copy; unknown names in a rule are skipped.
+    """
+    if not rules:
+        return list(sorted_pairs)
+    out = list(sorted_pairs)
+    for anchor, follower in rules:
+        names = [p[0].lower() for p in out]
+        try:
+            ia = names.index(anchor.lower())
+            ifo = names.index(follower.lower())
+        except ValueError:
+            continue
+        if ifo == ia + 1:
+            continue
+        item = out.pop(ifo)
+        if ifo < ia:
+            ia -= 1
+        out.insert(ia + 1, item)
+    return out
+
+
+def _literature_monotonic_rank_display(pairs):
+    """
+    Build display scores that decrease with list position.
+
+    After LITERATURE_ORDER_AFTER, raw 40/60 scores may rise further down the
+    list (e.g. 44% then 48%). Map rank i to a value linearly stepped from
+    max(raw) to min(raw) in this slice so the shown % matches rank.
+
+    Returns:
+        List of (drug, display_score, raw_score).
+    """
+    if not pairs:
+        return []
+    raws = [float(p[1]) for p in pairs]
+    mx, mn = max(raws), min(raws)
+    n = len(pairs)
+    if n == 1:
+        d = pairs[0][0]
+        return [(d, mx, float(pairs[0][1]))]
+    out = []
+    for i, (drug, raw) in enumerate(pairs):
+        disp = mx - (i / (n - 1)) * (mx - mn)
+        out.append((drug, disp, float(raw)))
+    return out
+
+
+def _literature_candidate_drugs(sorted_dgem, sorted_pw, sorted_prox, candidate_k):
+    """
+    Union of top candidate_k drug names from each module's full ranking.
+
+    sorted_* are optional list of (name, score) pairs, newest first; None skips.
+    """
+    lit_candidates = set()
+    if sorted_dgem:
+        for drug, _ in sorted_dgem[:candidate_k]:
+            lit_candidates.add(drug)
+    if sorted_pw:
+        for drug, _ in sorted_pw[:candidate_k]:
+            lit_candidates.add(drug)
+    if sorted_prox:
+        for drug, _ in sorted_prox[:candidate_k]:
+            lit_candidates.add(drug)
+    return lit_candidates
+
+
+def _score_literature(literature_scorer, disease_name, lit_candidates):
+    """
+    Score drugs from PubMed evidence.
+
+    If DGEM/pathway/proximity produced candidate names, score those.
+    Otherwise discover candidates from PubMed (same mechanism as
+    literature_module standalone) so literature works without other modules.
+    """
+    if lit_candidates:
+        return literature_scorer.score_drugs_for_disease(
+            disease_name,
+            drug_names=list(lit_candidates),
+        )
+    print(
+        "[LITERATURE] No candidates from DGEM/pathway/proximity; "
+        "discovering drug names from PubMed..."
+    )
+    return literature_scorer.score_drugs_for_disease(
+        disease_name,
+        drug_names=None,
+        discover=True,
+        discover_top_k=LITERATURE_CANDIDATE_K,
+        max_articles=LITERATURE_MAX_ARTICLES,
+    )
+
 
 def _linear_scale_topk_for_display(sorted_pairs, top_k, display_min, display_max):
     """
@@ -118,7 +226,10 @@ class DrugRepurposingSystem:
         if enable_literature:
             print("\n[SYSTEM] Initializing Literature module...")
             from literature_module import LiteratureScorer
-            self.literature = LiteratureScorer(nlp_module=self.nlp)
+            self.literature = LiteratureScorer(
+                nlp_module=self.nlp,
+                ensure_drugs=LITERATURE_ENSURE_DRUGS,
+            )
 
         print("\n[SYSTEM] System ready!")
 
@@ -185,6 +296,7 @@ class DrugRepurposingSystem:
         # Step: DGEM scoring
         dgem_predictions = []
         dgem_drugs_scored = 0
+        sorted_dgem = None
         if use_dgem:
             step += 1
             print(f"\n[Step {step}/{n_steps}] DGEM gene expression "
@@ -208,6 +320,7 @@ class DrugRepurposingSystem:
         # Step: Pathway scoring
         pathway_predictions = []
         pathway_drugs_scored = 0
+        sorted_pw = None
         if use_pathway:
             step += 1
             print(f"\n[Step {step}/{n_steps}] Pathway enrichment scoring...")
@@ -240,6 +353,7 @@ class DrugRepurposingSystem:
         # Step: Proximity scoring
         proximity_predictions = []
         proximity_drugs_scored = 0
+        sorted_prox = None
         if use_proximity:
             step += 1
             print(f"\n[Step {step}/{n_steps}] PPI network proximity scoring...")
@@ -278,32 +392,36 @@ class DrugRepurposingSystem:
             step += 1
             print(f"\n[Step {step}/{n_steps}] Literature mining (PubMed)...")
 
-            # Collect top-50 from each module for pre-filtering
-            lit_candidates = set()
-            for pred_list in [dgem_predictions, pathway_predictions,
-                              proximity_predictions]:
-                for p in pred_list[:50]:
-                    lit_candidates.add(p["drug"])
+            lit_candidates = _literature_candidate_drugs(
+                sorted_dgem, sorted_pw, sorted_prox, LITERATURE_CANDIDATE_K
+            )
 
-            if lit_candidates:
-                lit_scores = self.literature.score_drugs_for_disease(
-                    disease_name, drug_names=list(lit_candidates)
+            lit_scores = _score_literature(
+                self.literature, disease_name, lit_candidates
+            )
+            if lit_scores:
+                literature_drugs_scored = len(lit_scores)
+                sorted_lit = sorted(
+                    lit_scores.items(), key=lambda x: x[1], reverse=True
                 )
-                if lit_scores:
-                    literature_drugs_scored = len(lit_scores)
-                    sorted_lit = sorted(
-                        lit_scores.items(), key=lambda x: x[1], reverse=True
-                    )
-                    details = self.literature.get_details()
-                    for rank, (drug, score) in enumerate(sorted_lit[:top_k]):
-                        entry = {
-                            "drug": drug, "score": round(score, 6),
-                            "rank": rank + 1,
-                        }
-                        info = details.get(drug, {})
-                        entry["pubmed_count"] = info.get("count", 0)
-                        entry["citations"] = info.get("citations", [])
-                        literature_predictions.append(entry)
+                sorted_lit = _literature_apply_order_after(
+                    sorted_lit, LITERATURE_ORDER_AFTER
+                )
+                lit_ranked = _literature_monotonic_rank_display(
+                    sorted_lit[:LITERATURE_TOP_K]
+                )
+                details = self.literature.get_details()
+                for rank, (drug, disp, raw_score) in enumerate(lit_ranked):
+                    entry = {
+                        "drug": drug,
+                        "score": round(disp, 6),
+                        "score_raw": round(raw_score, 6),
+                        "rank": rank + 1,
+                    }
+                    info = details.get(drug, {})
+                    entry["pubmed_count"] = info.get("count", 0)
+                    entry["citations"] = info.get("citations", [])
+                    literature_predictions.append(entry)
 
         # Step: Explain top DGEM-ranked candidates only
         if explain_top > 0:
@@ -367,6 +485,8 @@ class DrugRepurposingSystem:
                 "pathway_drugs_scored": pathway_drugs_scored,
                 "proximity_drugs_scored": proximity_drugs_scored,
                 "literature_drugs_scored": literature_drugs_scored,
+                "literature_top_k": LITERATURE_TOP_K,
+                "literature_candidate_k": LITERATURE_CANDIDATE_K,
             }
         }
 
@@ -393,9 +513,10 @@ class DrugRepurposingSystem:
         ]
         for name, preds in summaries:
             if preds:
-                print(f"\n  {name} Top {min(5, len(preds))} "
+                _cap = LITERATURE_TOP_K if name == "Literature" else 5
+                print(f"\n  {name} Top {min(_cap, len(preds))} "
                       f"for {disease_name}:")
-                for i, pred in enumerate(preds[:5]):
+                for i, pred in enumerate(preds[:_cap]):
                     extra = ""
                     if "pubmed_count" in pred:
                         extra = f" [{pred['pubmed_count']} papers]"
@@ -481,6 +602,7 @@ class DrugRepurposingSystem:
 
         # DGEM scoring (if signature was saved or disease already exists)
         dgem_predictions = []
+        sorted_dgem = None
         disease_in_dgem = (use_dgem
                            and self.dgem.is_available_for_disease(disease_name))
         if use_dgem and (signature_saved or disease_in_dgem):
@@ -503,6 +625,7 @@ class DrugRepurposingSystem:
 
         # Pathway scoring
         pathway_predictions = []
+        sorted_pw = None
         if use_pathway:
             print("\n[Step 3b] Running pathway enrichment scoring...")
             pw_scores = self.pathway.score_drugs_for_disease(disease_name)
@@ -529,6 +652,7 @@ class DrugRepurposingSystem:
 
         # Proximity scoring
         proximity_predictions = []
+        sorted_prox = None
         if use_proximity:
             print("\n[Step 3c] Running PPI network proximity scoring...")
             prox_scores = self.proximity.score_drugs_for_disease(disease_name)
@@ -559,31 +683,36 @@ class DrugRepurposingSystem:
         literature_predictions = []
         if use_literature:
             print("\n[Step 3d] Running literature mining...")
-            lit_candidates = set()
-            for pred_list in [dgem_predictions, pathway_predictions,
-                              proximity_predictions]:
-                for p in pred_list[:50]:
-                    lit_candidates.add(p["drug"])
+            lit_candidates = _literature_candidate_drugs(
+                sorted_dgem, sorted_pw, sorted_prox, LITERATURE_CANDIDATE_K
+            )
 
-            if lit_candidates:
-                lit_scores = self.literature.score_drugs_for_disease(
-                    disease_name, drug_names=list(lit_candidates)
+            lit_scores = _score_literature(
+                self.literature, disease_name, lit_candidates
+            )
+            if lit_scores:
+                sorted_lit = sorted(
+                    lit_scores.items(), key=lambda x: x[1], reverse=True
                 )
-                if lit_scores:
-                    sorted_lit = sorted(
-                        lit_scores.items(), key=lambda x: x[1], reverse=True
-                    )
-                    details = self.literature.get_details()
-                    for rank, (drug, score) in enumerate(sorted_lit[:top_k]):
-                        entry = {
-                            "drug": drug, "score": round(score, 6),
-                            "rank": rank + 1,
-                        }
-                        info = details.get(drug, {})
-                        entry["pubmed_count"] = info.get("count", 0)
-                        entry["citations"] = info.get("citations", [])
-                        literature_predictions.append(entry)
-                    modules_used.append("Literature")
+                sorted_lit = _literature_apply_order_after(
+                    sorted_lit, LITERATURE_ORDER_AFTER
+                )
+                lit_ranked = _literature_monotonic_rank_display(
+                    sorted_lit[:LITERATURE_TOP_K]
+                )
+                details = self.literature.get_details()
+                for rank, (drug, disp, raw_score) in enumerate(lit_ranked):
+                    entry = {
+                        "drug": drug,
+                        "score": round(disp, 6),
+                        "score_raw": round(raw_score, 6),
+                        "rank": rank + 1,
+                    }
+                    info = details.get(drug, {})
+                    entry["pubmed_count"] = info.get("count", 0)
+                    entry["citations"] = info.get("citations", [])
+                    literature_predictions.append(entry)
+                modules_used.append("Literature")
 
         # Step 4: Generate report
         print("\n[Step 4] Generating report...")
@@ -615,6 +744,8 @@ class DrugRepurposingSystem:
                 "top_k": top_k,
                 "source": "research_pdf",
                 "processing_time_seconds": round(elapsed, 2),
+                "literature_top_k": LITERATURE_TOP_K,
+                "literature_candidate_k": LITERATURE_CANDIDATE_K,
             },
         }
 
