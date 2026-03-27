@@ -312,20 +312,37 @@ disease_list = st.session_state["disease_list"]
 
 
 # ─── Shared helper: render scoring module tabs ───
-def _render_scoring_tabs(results):
-    """Render Pathway / Proximity prediction tabs."""
-    other_modules = [
-        (
-            "Pathway scorer",
-            "pathway_predictions",
-            "Pathway-based scores for each candidate drug.",
-        ),
-        (
-            "Shortest path - Network proximity",
-            "proximity_predictions",
-            "Target proximity and shortest-path distance in the network.",
-        ),
-    ]
+def _render_scoring_tabs(results, include_literature=False):
+    """
+    Render Pathway / Proximity prediction tabs.
+
+    On the Drug Repurposing tab, literature is shown in its own column above;
+    set include_literature=True for Research PDF Analysis so literature appears
+    here too (otherwise it would never be shown).
+    """
+    other_modules = []
+    if include_literature:
+        other_modules.append(
+            (
+                "Literature mining",
+                "literature_predictions",
+                "PubMed co-occurrence and abstract relevance (40% + 60%).",
+            ),
+        )
+    other_modules.extend(
+        [
+            (
+                "Pathway scorer",
+                "pathway_predictions",
+                "Pathway-based scores for each candidate drug.",
+            ),
+            (
+                "Shortest path - Network proximity",
+                "proximity_predictions",
+                "Target proximity and shortest-path distance in the network.",
+            ),
+        ]
+    )
 
     other_tab_names = []
     other_tab_data = []
@@ -737,8 +754,9 @@ with tab_research:
                         f":{color}[{pct:.0f}%]"
                     )
 
-            # ── Other scoring modules ──
-            _render_scoring_tabs(results)
+            # ── Other scoring modules (include literature; not shown elsewhere
+            #     on this tab, unlike Drug Repurposing)
+            _render_scoring_tabs(results, include_literature=True)
 
             # ── Report ──
             if results.get("report"):

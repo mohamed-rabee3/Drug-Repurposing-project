@@ -24,6 +24,8 @@ LITERATURE_CANDIDATE_K = 50
 LITERATURE_TOP_K = 10
 # PubMed articles scanned when no graph/pathway/proximity candidates exist.
 LITERATURE_MAX_ARTICLES = 200
+# Abstracts per drug sent to the LLM in one batched call (lower = faster).
+LITERATURE_MAX_LLM_ABSTRACTS = 3
 # Always merged into the literature scoring list if missing. PubMed discovery
 # often under-ranks lipids (indexed as metabolites, not with drug MeSH flags).
 LITERATURE_ENSURE_DRUGS = ["cholesterol"]
@@ -85,21 +87,36 @@ def _literature_monotonic_rank_display(pairs):
 
 def _literature_candidate_drugs(sorted_dgem, sorted_pw, sorted_prox, candidate_k):
     """
-    Union of top candidate_k drug names from each module's full ranking.
+    Union of top candidate_k from each module, then keep the best candidate_k
+    overall by minimum rank across modules (lower rank = stronger signal).
 
     sorted_* are optional list of (name, score) pairs, newest first; None skips.
     """
-    lit_candidates = set()
-    if sorted_dgem:
-        for drug, _ in sorted_dgem[:candidate_k]:
-            lit_candidates.add(drug)
-    if sorted_pw:
-        for drug, _ in sorted_pw[:candidate_k]:
-            lit_candidates.add(drug)
-    if sorted_prox:
-        for drug, _ in sorted_prox[:candidate_k]:
-            lit_candidates.add(drug)
-    return lit_candidates
+    def top_k_ranks(sorted_pairs, k):
+        if not sorted_pairs:
+            return {}
+        return {drug: i + 1 for i, (drug, _) in enumerate(sorted_pairs[:k])}
+
+    rd = top_k_ranks(sorted_dgem, candidate_k)
+    rp = top_k_ranks(sorted_pw, candidate_k)
+    rx = top_k_ranks(sorted_prox, candidate_k)
+
+    all_drugs = set(rd) | set(rp) | set(rx)
+    if not all_drugs:
+        return []
+
+    def best_rank(name):
+        ranks = []
+        if name in rd:
+            ranks.append(rd[name])
+        if name in rp:
+            ranks.append(rp[name])
+        if name in rx:
+            ranks.append(rx[name])
+        return min(ranks) if ranks else 10**9
+
+    ordered = sorted(all_drugs, key=lambda d: (best_rank(d), d.lower()))
+    return ordered[:candidate_k]
 
 
 def _score_literature(literature_scorer, disease_name, lit_candidates):
@@ -114,6 +131,8 @@ def _score_literature(literature_scorer, disease_name, lit_candidates):
         return literature_scorer.score_drugs_for_disease(
             disease_name,
             drug_names=list(lit_candidates),
+            max_llm_abstracts=LITERATURE_MAX_LLM_ABSTRACTS,
+            max_drugs=LITERATURE_CANDIDATE_K,
         )
     print(
         "[LITERATURE] No candidates from DGEM/pathway/proximity; "
@@ -125,6 +144,8 @@ def _score_literature(literature_scorer, disease_name, lit_candidates):
         discover=True,
         discover_top_k=LITERATURE_CANDIDATE_K,
         max_articles=LITERATURE_MAX_ARTICLES,
+        max_llm_abstracts=LITERATURE_MAX_LLM_ABSTRACTS,
+        max_drugs=LITERATURE_CANDIDATE_K,
     )
 
 

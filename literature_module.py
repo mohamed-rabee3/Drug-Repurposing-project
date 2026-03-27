@@ -93,6 +93,34 @@ class LiteratureScorer:
                 seen.add(key)
         return out
 
+    def _cap_drug_names_after_merge(self, drug_names, max_drugs):
+        """If len > max_drugs, keep ensure_drugs first, then rest in list order."""
+        if max_drugs is None or len(drug_names) <= max_drugs:
+            return drug_names
+        ens_lower = {
+            str(e).strip().lower()
+            for e in (self.ensure_drugs or [])
+            if e and str(e).strip()
+        }
+        if not ens_lower:
+            return drug_names[:max_drugs]
+        seen = set()
+        out = []
+        for n in drug_names:
+            if len(out) >= max_drugs:
+                return out
+            if n.lower() in ens_lower and n.lower() not in seen:
+                out.append(n)
+                seen.add(n.lower())
+        for n in drug_names:
+            if len(out) >= max_drugs:
+                break
+            if n.lower() in seen:
+                continue
+            out.append(n)
+            seen.add(n.lower())
+        return out
+
     @staticmethod
     def _pubmed_url(pmid):
         p = (pmid or "").strip()
@@ -563,13 +591,86 @@ class LiteratureScorer:
 
         return 5.0
 
+    def _score_abstracts_relevance_batch(self, drug_name, disease_name,
+                                         abstracts):
+        """
+        Score all abstracts in one LLM call (avoids N separate API calls per drug).
+
+        Returns:
+            List of floats 0-10, same length as abstracts (defaults to 5.0 on failure).
+        """
+        n = len(abstracts)
+        if not self.nlp or n == 0:
+            return [5.0] * n
+
+        parts = []
+        for i, abstract in enumerate(abstracts):
+            t = (abstract.get("title") or "")[:300]
+            a = (abstract.get("abstract") or "")[:1200]
+            parts.append(f"### Paper {i + 1}\nTitle: {t}\nAbstract: {a}")
+
+        block = "\n\n".join(parts)
+        prompt = (
+            f"For repurposing {drug_name} to treat {disease_name}, rate EACH "
+            f"paper below on how strongly its abstract supports that therapeutic "
+            f"use. Use scores 0-10 where:\n"
+            f"  0 = irrelevant\n"
+            f"  5 = mentions drug and disease but weak/no therapeutic link\n"
+            f"  10 = strong evidence of therapeutic benefit\n\n"
+            f"{block}\n\n"
+            f"Reply with ONLY valid JSON: {{\"scores\": [<n> papers, exactly "
+            f"{n} numbers in order], \"reason\": \"one short sentence\"}}"
+        )
+
+        try:
+            response = self.nlp._call_groq(
+                system_prompt=(
+                    "You are a biomedical literature reviewer. "
+                    "Output only the requested JSON."
+                ),
+                user_prompt=prompt,
+                temperature=0.1,
+                max_tokens=350,
+                use_cache=True,
+            )
+            parsed = self.nlp._parse_json_response(response)
+            if isinstance(parsed, dict) and not parsed.get("parse_error"):
+                raw = parsed.get("scores")
+                if isinstance(raw, list) and len(raw) >= n:
+                    out = []
+                    for j in range(n):
+                        try:
+                            v = float(raw[j])
+                            out.append(max(0.0, min(10.0, v)))
+                        except (TypeError, ValueError):
+                            out.append(5.0)
+                    return out
+                if isinstance(raw, list) and len(raw) > 0:
+                    # Partial list: pad with 5.0
+                    out = []
+                    for j in range(n):
+                        try:
+                            v = float(raw[j]) if j < len(raw) else 5.0
+                            out.append(max(0.0, min(10.0, v)))
+                        except (TypeError, ValueError):
+                            out.append(5.0)
+                    return out
+        except Exception:
+            pass
+
+        # Fallback: score first abstract only (one API call), rest neutral
+        first = self._score_abstract_relevance(
+            drug_name, disease_name, abstracts[0])
+        return [first] + [5.0] * (n - 1)
+
     # ------------------------------------------------------------------ #
     #  Main scoring — now with auto-discovery
     # ------------------------------------------------------------------ #
 
     def score_drugs_for_disease(self, disease_name, drug_names=None,
                                 top_k=20, discover=True,
-                                discover_top_k=50, max_articles=200):
+                                discover_top_k=50, max_articles=200,
+                                max_llm_abstracts=3, max_drugs=None):
         """
         Score drugs by literature evidence.
 
@@ -585,6 +686,10 @@ class LiteratureScorer:
                       candidates from PubMed.
             discover_top_k: How many candidates to discover.
             max_articles: Max articles to scan during discovery.
+            max_llm_abstracts: How many PubMed abstracts per drug to send to the
+                LLM (batched in one call per drug). Lower = faster.
+            max_drugs: If set, cap how many drugs are scored after merging
+                ensure_drugs (ensure list is kept first when trimming).
 
         Returns:
             Dict mapping drug_name -> literature_score (0-1).
@@ -600,6 +705,7 @@ class LiteratureScorer:
             drug_names = drug_names or []
 
         drug_names = self._merge_ensure_drugs(drug_names)
+        drug_names = self._cap_drug_names_after_merge(drug_names, max_drugs)
 
         if not drug_names:
             print("[LITERATURE] No drug candidates to score.")
@@ -611,9 +717,11 @@ class LiteratureScorer:
         raw_scores = {}
         details = {}
 
+        cap_abs = max(1, min(10, int(max_llm_abstracts)))
+
         for i, drug_name in enumerate(drug_names):
-            if (i + 1) % 50 == 0:
-                print(f"  ...searched {i+1}/{len(drug_names)}")
+            if (i + 1) % 10 == 0 or (i + 1) == len(drug_names):
+                print(f"  ...literature {i+1}/{len(drug_names)} drugs")
 
             count, pmids = self._search_pubmed(drug_name, disease_name)
 
@@ -627,15 +735,13 @@ class LiteratureScorer:
                     pmids, drug_name, disease_name
                 )
                 if abstracts and self.nlp:
-                    scores = []
-                    for abstract in abstracts[:5]:
-                        s = self._score_abstract_relevance(
-                            drug_name, disease_name, abstract
-                        )
-                        scores.append(s)
-                    llm_score = np.mean(scores) / 10.0
+                    to_score = abstracts[:cap_abs]
+                    batch_scores = self._score_abstracts_relevance_batch(
+                        drug_name, disease_name, to_score
+                    )
+                    llm_score = float(np.mean(batch_scores)) / 10.0
                 citations = []
-                for a in abstracts[:5]:
+                for a in abstracts[:cap_abs]:
                     line = self._abstract_citation_line(a)
                     if line:
                         citations.append(line)
