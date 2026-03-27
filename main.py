@@ -4,34 +4,61 @@ Orchestrator: Connects TxGNN (graph) + GPT-OSS 20B (language) modules
 This is the main entry point for the drug repurposing system.
 """
 
-import torch_cuda_ld_path
-
-torch_cuda_ld_path.apply()
-
 import json
 import os
 import time
 from datetime import datetime
-from graph_module import DrugRepurposingGNN
 from nlp_module import BiomedicalNLP
-from explain_module import RepurposingExplainer
-from eval_module import RepurposingEvaluator
-from dgem_module import DGEMScorer
+from dgem_module import DGEMScorer, build_dgem_prediction_entries
+from research_module import ResearchPDFAnalyzer
+
+
+# UI display scaling for top-k lists (raw scores stay in score_raw)
+PATHWAY_DISPLAY_MIN = 0.40
+PATHWAY_DISPLAY_MAX = 0.74
+PROXIMITY_DISPLAY_MIN = 0.40
+PROXIMITY_DISPLAY_MAX = 0.80
+
+
+def _linear_scale_topk_for_display(sorted_pairs, top_k, display_min, display_max):
+    """
+    Linearly map raw scores within the top-k slice to [display_min, display_max].
+
+    Args:
+        sorted_pairs: [(name, score), ...] sorted by score descending.
+    Returns:
+        List of (drug, display_score, raw_score, rank_1based).
+    """
+    sl = sorted_pairs[:top_k]
+    if not sl:
+        return []
+    raws = [float(s) for _, s in sl]
+    mn, mx = min(raws), max(raws)
+    span = mx - mn
+    out = []
+    for i, (drug, raw) in enumerate(sl):
+        raw_f = float(raw)
+        if span > 1e-12:
+            disp = display_min + (raw_f - mn) / span * (
+                display_max - display_min
+            )
+        else:
+            disp = (display_min + display_max) / 2.0
+        out.append((drug, disp, raw_f, i + 1))
+    return out
 
 
 class DrugRepurposingSystem:
     """Main system that orchestrates GNN + NLP for drug repurposing."""
 
-    def __init__(self, data_folder="./data", model_folder="./models",
-                 output_folder="./outputs", enable_dgem=True,
-                 enable_pathway=True, enable_proximity=True,
-                 enable_literature=True):
+    def __init__(self, data_folder="./data", output_folder="./outputs",
+                 enable_dgem=True, enable_pathway=True,
+                 enable_proximity=True, enable_literature=True):
         """
         Initialize all modules.
 
         Args:
-            data_folder: Where TxGNN knowledge graph data is stored.
-            model_folder: Where trained model checkpoints are saved.
+            data_folder: Where data files are stored.
             output_folder: Where results are written.
             enable_dgem: If True, initialize DGEM gene expression module.
             enable_pathway: If True, initialize pathway scoring module.
@@ -46,14 +73,11 @@ class DrugRepurposingSystem:
 
         print("=" * 60)
         print("  AI DRUG REPURPOSING SYSTEM")
-        print("  TxGNN + DGEM + Pathway + Proximity + Literature")
+        print("  DGEM + Pathway + Proximity + Literature")
         print("  GPT-OSS 20B (Groq)")
         print("=" * 60)
 
         # Initialize modules
-        print("\n[SYSTEM] Initializing GNN module...")
-        self.gnn = DrugRepurposingGNN(data_folder, model_folder)
-
         print("\n[SYSTEM] Initializing NLP module...")
         self.nlp = BiomedicalNLP()
 
@@ -96,39 +120,13 @@ class DrugRepurposingSystem:
             from literature_module import LiteratureScorer
             self.literature = LiteratureScorer(nlp_module=self.nlp)
 
-        # Initialize explainability and evaluation modules
-        self.explainer = RepurposingExplainer(self.nlp, output_folder)
-        self.evaluator = RepurposingEvaluator(output_folder)
-
         print("\n[SYSTEM] System ready!")
 
-    def setup_gnn(self, split="random", train=True, epochs=500):
-        """
-        Set up the GNN: load KG, initialize, and optionally train.
-
-        Args:
-            split: "random" for easy testing, "complex_disease" for real eval.
-            train: If True, train from scratch. If False, try to load saved model.
-            epochs: Number of fine-tuning epochs.
-        """
-        self.gnn.load_knowledge_graph(split=split)
-        self.gnn.initialize_model()
-
-        if train:
-            self.gnn.train(finetune_epochs=epochs)
-        else:
-            try:
-                self.gnn.load_model()
-            except FileNotFoundError:
-                print("[SYSTEM] No saved model found. Training new model...")
-                self.gnn.train(finetune_epochs=epochs)
-
-    def repurpose(self, disease_name, top_k=10, explain_top=5):
+    def repurpose(self, disease_name, top_k=10, explain_top=10):
         """
         Full drug repurposing pipeline for a disease.
 
         Produces separate ranked lists from each scoring module:
-          - TxGNN: GNN embedding similarity
           - DGEM: gene expression reversal
           - Pathway: pathway enrichment (Fisher's exact test)
           - Proximity: PPI network distance
@@ -137,7 +135,7 @@ class DrugRepurposingSystem:
         Args:
             disease_name: e.g., "Alzheimer disease"
             top_k: Number of drug candidates from each method.
-            explain_top: Number of top drugs to explain via NLP.
+            explain_top: Number of top DGEM-ranked drugs to explain via NLP.
 
         Returns:
             Dict with complete results.
@@ -148,7 +146,7 @@ class DrugRepurposingSystem:
         use_literature = self.literature is not None
 
         # Count active steps
-        n_steps = 3  # NLP context + GNN + report
+        n_steps = 2  # NLP context + report
         if explain_top > 0:
             n_steps += 1
         if use_dgem:
@@ -160,7 +158,7 @@ class DrugRepurposingSystem:
         if use_literature:
             n_steps += 1
 
-        modules = ["TxGNN"]
+        modules = []
         if use_dgem:
             modules.append("DGEM")
         if use_pathway:
@@ -184,19 +182,6 @@ class DrugRepurposingSystem:
               "from GPT-OSS 20B...")
         disease_context = self.nlp.enrich_disease_context(disease_name)
 
-        # Step: GNN predictions
-        step += 1
-        print(f"\n[Step {step}/{n_steps}] Predicting top {top_k} "
-              "drug candidates with TxGNN...")
-        try:
-            disease_idx = self.gnn.find_disease_idx(disease_name)
-            gnn_predictions = self.gnn.predict_drugs_for_disease(
-                disease_idx=disease_idx, top_k=top_k
-            )
-        except (RuntimeError, ValueError) as e:
-            print(f"[SYSTEM] GNN prediction failed: {e}")
-            gnn_predictions = []
-
         # Step: DGEM scoring
         dgem_predictions = []
         dgem_drugs_scored = 0
@@ -215,11 +200,9 @@ class DrugRepurposingSystem:
                 sorted_dgem = sorted(
                     dgem_scores.items(), key=lambda x: x[1], reverse=True
                 )
-                for rank, (drug, score) in enumerate(sorted_dgem[:top_k]):
-                    dgem_predictions.append({
-                        "drug": drug, "score": round(score, 6),
-                        "rank": rank + 1,
-                    })
+                dgem_predictions = build_dgem_prediction_entries(
+                    sorted_dgem, top_k
+                )
                 print(f"[DGEM] Scored {dgem_drugs_scored} drugs")
 
         # Step: Pathway scoring
@@ -231,14 +214,25 @@ class DrugRepurposingSystem:
             pw_scores = self.pathway.score_drugs_for_disease(disease_name)
             if pw_scores:
                 pathway_drugs_scored = len(pw_scores)
+                pw_details = self.pathway.get_drug_pathways()
                 sorted_pw = sorted(
                     pw_scores.items(), key=lambda x: x[1], reverse=True
                 )
-                for rank, (drug, score) in enumerate(sorted_pw[:top_k]):
-                    pathway_predictions.append({
-                        "drug": drug, "score": round(score, 6),
-                        "rank": rank + 1,
-                    })
+                for drug, disp, raw_f, rank in _linear_scale_topk_for_display(
+                    sorted_pw,
+                    top_k,
+                    PATHWAY_DISPLAY_MIN,
+                    PATHWAY_DISPLAY_MAX,
+                ):
+                    entry = {
+                        "drug": drug,
+                        "score": round(disp, 6),
+                        "score_raw": round(raw_f, 6),
+                        "rank": rank,
+                    }
+                    if drug in pw_details:
+                        entry["pathways"] = pw_details[drug]
+                    pathway_predictions.append(entry)
                 print(f"[PATHWAY] Scored {pathway_drugs_scored} drugs")
             else:
                 print("[PATHWAY] No pathway data for this disease.")
@@ -252,14 +246,27 @@ class DrugRepurposingSystem:
             prox_scores = self.proximity.score_drugs_for_disease(disease_name)
             if prox_scores:
                 proximity_drugs_scored = len(prox_scores)
+                prox_details = self.proximity.get_drug_details()
                 sorted_prox = sorted(
                     prox_scores.items(), key=lambda x: x[1], reverse=True
                 )
-                for rank, (drug, score) in enumerate(sorted_prox[:top_k]):
-                    proximity_predictions.append({
-                        "drug": drug, "score": round(score, 6),
-                        "rank": rank + 1,
-                    })
+                for drug, disp, raw_f, rank in _linear_scale_topk_for_display(
+                    sorted_prox,
+                    top_k,
+                    PROXIMITY_DISPLAY_MIN,
+                    PROXIMITY_DISPLAY_MAX,
+                ):
+                    entry = {
+                        "drug": drug,
+                        "score": round(disp, 6),
+                        "score_raw": round(raw_f, 6),
+                        "rank": rank,
+                    }
+                    info = prox_details.get(drug, {})
+                    if info:
+                        entry["targets"] = info["targets"]
+                        entry["shortest_path"] = info["shortest_path"]
+                    proximity_predictions.append(entry)
                 print(f"[PROXIMITY] Scored {proximity_drugs_scored} drugs")
             else:
                 print("[PROXIMITY] No proximity data for this disease.")
@@ -273,8 +280,8 @@ class DrugRepurposingSystem:
 
             # Collect top-50 from each module for pre-filtering
             lit_candidates = set()
-            for pred_list in [gnn_predictions, dgem_predictions,
-                              pathway_predictions, proximity_predictions]:
+            for pred_list in [dgem_predictions, pathway_predictions,
+                              proximity_predictions]:
                 for p in pred_list[:50]:
                     lit_candidates.add(p["drug"])
 
@@ -295,45 +302,55 @@ class DrugRepurposingSystem:
                         }
                         info = details.get(drug, {})
                         entry["pubmed_count"] = info.get("count", 0)
+                        entry["citations"] = info.get("citations", [])
                         literature_predictions.append(entry)
 
-        # Step: Explain top predictions (TxGNN + DGEM top 5)
+        # Step: Explain top DGEM-ranked candidates only
         if explain_top > 0:
             step += 1
-            print(f"\n[Step {step}/{n_steps}] Explaining top {explain_top} "
-                  "candidates with GPT-OSS 20B...")
-            # Collect unique drug names from TxGNN and DGEM top-5
             explain_drugs = []
             seen = set()
-            for pred_list in [gnn_predictions, dgem_predictions]:
-                for p in pred_list[:explain_top]:
-                    name = p["drug"]
-                    if name.lower() not in seen:
-                        seen.add(name.lower())
-                        explain_drugs.append(name)
-            explanations = (
-                self.nlp.batch_explain(disease_name, explain_drugs)
-                if explain_drugs else {}
-            )
+            for p in dgem_predictions[:explain_top]:
+                name = p["drug"]
+                if name.lower() not in seen:
+                    seen.add(name.lower())
+                    explain_drugs.append(name)
+            if explain_drugs:
+                print(f"\n[Step {step}/{n_steps}] Explaining top "
+                      f"{len(explain_drugs)} DGEM candidates with "
+                      f"GPT-OSS 20B...")
+                explanations = self.nlp.batch_explain(
+                    disease_name, explain_drugs
+                )
+            else:
+                print(f"\n[Step {step}/{n_steps}] Skipping explanations "
+                      f"(no DGEM predictions for this disease).")
+                explanations = {}
         else:
             explanations = {}
 
         # Step: Report
         step += 1
         print(f"\n[Step {step}/{n_steps}] Generating comprehensive report...")
-        if gnn_predictions:
-            report = self.nlp.generate_report(disease_name, gnn_predictions)
+        report_preds = (dgem_predictions or pathway_predictions
+                        or proximity_predictions or literature_predictions)
+        if report_preds:
+            report = self.nlp.generate_report(
+                disease_name, report_preds,
+                module="dgem" if dgem_predictions else "txgnn"
+            )
         else:
             report = self.nlp.generate_report(
-                disease_name, [{"drug": "N/A", "score": 0}]
+                disease_name, [{"drug": "N/A", "score": 0}],
+                module="txgnn",
             )
 
         # Build results
         elapsed = time.time() - start_time
+        report_source = "dgem" if dgem_predictions else "none"
         results = {
             "disease": disease_name,
             "disease_context": disease_context,
-            "txgnn_predictions": gnn_predictions,
             "dgem_predictions": dgem_predictions,
             "pathway_predictions": pathway_predictions,
             "proximity_predictions": proximity_predictions,
@@ -344,6 +361,7 @@ class DrugRepurposingSystem:
                 "timestamp": datetime.now().isoformat(),
                 "modules": modules,
                 "top_k": top_k,
+                "report_source": report_source,
                 "processing_time_seconds": round(elapsed, 2),
                 "dgem_drugs_scored": dgem_drugs_scored,
                 "pathway_drugs_scored": pathway_drugs_scored,
@@ -368,7 +386,6 @@ class DrugRepurposingSystem:
 
         # Print summaries
         summaries = [
-            ("TxGNN", gnn_predictions),
             ("DGEM", dgem_predictions),
             ("Pathway", pathway_predictions),
             ("Proximity", proximity_predictions),
@@ -387,29 +404,236 @@ class DrugRepurposingSystem:
 
         return results
 
-    def evaluate(self):
-        """Run evaluation on the trained GNN model."""
-        if not self.gnn.is_trained:
-            raise RuntimeError("Train or load the model first!")
+    def analyze_research_pdf(self, pdf_file=None, top_k=20,
+                             save_signature=True, pre_extracted=None):
+        """
+        Analyze a research PDF: extract disease info, save gene expression
+        signature, and run scoring modules.
 
-        print("\n[SYSTEM] Running evaluation...")
-        return self.evaluator.evaluate_txgnn(self.gnn.tx_model)
+        Args:
+            pdf_file: Streamlit UploadedFile object (ignored if pre_extracted).
+            top_k: Number of drug candidates per module.
+            save_signature: If True, save extracted gene expression to DGEM.
+            pre_extracted: If provided, skip PDF extraction and use this dict
+                (from ResearchPDFAnalyzer.analyze()) directly.
 
-    def explain_with_graphmask(self, relation="indication"):
-        """Train GraphMask explainability on the current model."""
-        if not self.gnn.is_trained:
-            raise RuntimeError("Train or load the model first!")
+        Returns:
+            Dict with extracted info and scoring results.
+        """
+        use_dgem = self.dgem is not None and self.dgem._initialized
+        use_pathway = self.pathway is not None and self.pathway._initialized
+        use_proximity = (self.proximity is not None
+                         and self.proximity._initialized)
+        use_literature = self.literature is not None
 
-        print("\n[SYSTEM] Training GraphMask explainability...")
-        self.explainer.train_graphmask(self.gnn.tx_model, relation)
+        print(f"\n{'='*60}")
+        print("  RESEARCH PDF ANALYSIS")
+        print(f"{'='*60}")
+        start_time = time.time()
 
-    def list_diseases(self):
-        """List all diseases in the knowledge graph."""
-        return self.gnn.get_all_diseases()
+        # Step 1: Extract info from PDF (or reuse pre-extracted)
+        if pre_extracted is not None:
+            print("\n[Step 1] Using pre-extracted PDF data...")
+            analysis = pre_extracted
+        else:
+            print("\n[Step 1] Extracting information from PDF...")
+            analyzer = ResearchPDFAnalyzer(self.nlp, self.dgem)
+            analysis = analyzer.analyze(pdf_file)
 
-    def list_drugs(self):
-        """List all drugs in the knowledge graph."""
-        return self.gnn.get_all_drugs()
+        extracted_info = analysis["extracted_info"]
+        disease_name = extracted_info.get("disease_name", "")
+        gene_expressions = extracted_info.get("gene_expressions", [])
+        pathways = extracted_info.get("pathways", [])
+
+        if not disease_name:
+            print("[WARN] Could not extract disease name from PDF.")
+            return {"error": "Could not extract disease name from PDF",
+                    "extracted_info": extracted_info}
+
+        print(f"[PDF] Disease: {disease_name}")
+        print(f"[PDF] Genes extracted: {len(gene_expressions)}")
+        print(f"[PDF] Pathways: {len(pathways)}")
+
+        # Step 2: Save gene expression signature if available
+        signature_saved = False
+        alignment_stats = analysis["alignment_stats"]
+
+        if (save_signature and use_dgem
+                and analysis["signature_vector"] is not None
+                and alignment_stats.get("matched_l1000", 0) > 0):
+            print("\n[Step 2] Saving gene expression signature to DGEM...")
+            metadata = {
+                "method": "pdf_extraction",
+                "source": "research_pdf",
+                "genes_extracted": len(gene_expressions),
+                "genes_matched_l1000": alignment_stats["matched_l1000"],
+                "timestamp": datetime.now().isoformat(),
+            }
+            signature_saved = self.dgem.save_disease_signature(
+                disease_name, analysis["signature_vector"], metadata
+            )
+        else:
+            print("\n[Step 2] Skipping signature save "
+                  "(no gene expression data or DGEM unavailable).")
+
+        # Step 3: Run scoring modules
+        modules_used = []
+
+        # DGEM scoring (if signature was saved or disease already exists)
+        dgem_predictions = []
+        disease_in_dgem = (use_dgem
+                           and self.dgem.is_available_for_disease(disease_name))
+        if use_dgem and (signature_saved or disease_in_dgem):
+            print("\n[Step 3a] Running DGEM scoring...")
+            all_drug_names = list(
+                self.dgem.drug_id_mapping.get("name_to_id", {}).keys()
+            ) if self.dgem.drug_id_mapping else []
+            dgem_scores = self.dgem.score_drugs_for_disease(
+                disease_name, drug_names=all_drug_names
+            )
+            if dgem_scores:
+                sorted_dgem = sorted(
+                    dgem_scores.items(), key=lambda x: x[1], reverse=True
+                )
+                dgem_predictions = build_dgem_prediction_entries(
+                    sorted_dgem, top_k
+                )
+                modules_used.append("DGEM")
+                print(f"[DGEM] Scored {len(dgem_scores)} drugs")
+
+        # Pathway scoring
+        pathway_predictions = []
+        if use_pathway:
+            print("\n[Step 3b] Running pathway enrichment scoring...")
+            pw_scores = self.pathway.score_drugs_for_disease(disease_name)
+            if pw_scores:
+                pw_details = self.pathway.get_drug_pathways()
+                sorted_pw = sorted(
+                    pw_scores.items(), key=lambda x: x[1], reverse=True
+                )
+                for drug, disp, raw_f, rank in _linear_scale_topk_for_display(
+                    sorted_pw, top_k,
+                    PATHWAY_DISPLAY_MIN, PATHWAY_DISPLAY_MAX,
+                ):
+                    entry = {
+                        "drug": drug,
+                        "score": round(disp, 6),
+                        "score_raw": round(raw_f, 6),
+                        "rank": rank,
+                    }
+                    if drug in pw_details:
+                        entry["pathways"] = pw_details[drug]
+                    pathway_predictions.append(entry)
+                modules_used.append("Pathway")
+                print(f"[PATHWAY] Scored {len(pw_scores)} drugs")
+
+        # Proximity scoring
+        proximity_predictions = []
+        if use_proximity:
+            print("\n[Step 3c] Running PPI network proximity scoring...")
+            prox_scores = self.proximity.score_drugs_for_disease(disease_name)
+            if prox_scores:
+                prox_details = self.proximity.get_drug_details()
+                sorted_prox = sorted(
+                    prox_scores.items(), key=lambda x: x[1], reverse=True
+                )
+                for drug, disp, raw_f, rank in _linear_scale_topk_for_display(
+                    sorted_prox, top_k,
+                    PROXIMITY_DISPLAY_MIN, PROXIMITY_DISPLAY_MAX,
+                ):
+                    entry = {
+                        "drug": drug,
+                        "score": round(disp, 6),
+                        "score_raw": round(raw_f, 6),
+                        "rank": rank,
+                    }
+                    info = prox_details.get(drug, {})
+                    if info:
+                        entry["targets"] = info["targets"]
+                        entry["shortest_path"] = info["shortest_path"]
+                    proximity_predictions.append(entry)
+                modules_used.append("Proximity")
+                print(f"[PROXIMITY] Scored {len(prox_scores)} drugs")
+
+        # Literature scoring
+        literature_predictions = []
+        if use_literature:
+            print("\n[Step 3d] Running literature mining...")
+            lit_candidates = set()
+            for pred_list in [dgem_predictions, pathway_predictions,
+                              proximity_predictions]:
+                for p in pred_list[:50]:
+                    lit_candidates.add(p["drug"])
+
+            if lit_candidates:
+                lit_scores = self.literature.score_drugs_for_disease(
+                    disease_name, drug_names=list(lit_candidates)
+                )
+                if lit_scores:
+                    sorted_lit = sorted(
+                        lit_scores.items(), key=lambda x: x[1], reverse=True
+                    )
+                    details = self.literature.get_details()
+                    for rank, (drug, score) in enumerate(sorted_lit[:top_k]):
+                        entry = {
+                            "drug": drug, "score": round(score, 6),
+                            "rank": rank + 1,
+                        }
+                        info = details.get(drug, {})
+                        entry["pubmed_count"] = info.get("count", 0)
+                        entry["citations"] = info.get("citations", [])
+                        literature_predictions.append(entry)
+                    modules_used.append("Literature")
+
+        # Step 4: Generate report
+        print("\n[Step 4] Generating report...")
+        report_preds = (dgem_predictions or pathway_predictions
+                        or proximity_predictions or literature_predictions)
+        if report_preds:
+            report = self.nlp.generate_report(
+                disease_name, report_preds,
+                module="dgem" if dgem_predictions else "txgnn"
+            )
+        else:
+            report = f"No scoring data available for {disease_name}."
+
+        elapsed = time.time() - start_time
+
+        results = {
+            "disease": disease_name,
+            "extracted_info": extracted_info,
+            "alignment_stats": alignment_stats,
+            "signature_saved": signature_saved,
+            "dgem_predictions": dgem_predictions,
+            "pathway_predictions": pathway_predictions,
+            "proximity_predictions": proximity_predictions,
+            "literature_predictions": literature_predictions,
+            "report": report,
+            "metadata": {
+                "timestamp": datetime.now().isoformat(),
+                "modules": modules_used,
+                "top_k": top_k,
+                "source": "research_pdf",
+                "processing_time_seconds": round(elapsed, 2),
+            },
+        }
+
+        # Save results
+        safe_name = disease_name.replace(" ", "_").lower()
+        output_path = os.path.join(
+            self.output_folder,
+            f"research_{safe_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        )
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, default=str)
+
+        print(f"\n{'='*60}")
+        print(f"  RESULTS SAVED: {output_path}")
+        print(f"  Processing time: {elapsed:.1f} seconds")
+        print(f"{'='*60}")
+
+        return results
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -426,29 +650,12 @@ if __name__ == "__main__":
         help="Disease name to find repurposing candidates for"
     )
     parser.add_argument(
-        "--top-k", type=int, default=20,
+        "--top-k", type=int, default=10,
         help="Number of drug candidates to return"
     )
     parser.add_argument(
-        "--explain-top", type=int, default=5,
-        help="Number of top drugs to explain in detail"
-    )
-    parser.add_argument(
-        "--split", type=str, default="random",
-        choices=["random", "complex_disease", "full_graph"],
-        help="Data split type for GNN evaluation"
-    )
-    parser.add_argument(
-        "--epochs", type=int, default=100,
-        help="Number of fine-tuning epochs"
-    )
-    parser.add_argument(
-        "--train", action="store_true", default=False,
-        help="Train a new model (default: load existing)"
-    )
-    parser.add_argument(
-        "--discover", action="store_true", default=False,
-        help="Run node mapping discovery and exit"
+        "--explain-top", type=int, default=10,
+        help="Number of top DGEM-ranked drugs to explain in detail"
     )
     parser.add_argument(
         "--no-dgem", action="store_true", default=False,
@@ -476,20 +683,9 @@ if __name__ == "__main__":
         enable_literature=not args.no_literature,
     )
 
-    if args.discover:
-        system.gnn.load_knowledge_graph(split=args.split)
-        system.gnn.discover_node_mappings()
-    else:
-        # Set up GNN (train or load)
-        system.setup_gnn(
-            split=args.split,
-            train=args.train,
-            epochs=args.epochs
-        )
-
-        # Run repurposing
-        results = system.repurpose(
-            args.disease,
-            top_k=args.top_k,
-            explain_top=args.explain_top
-        )
+    # Run repurposing
+    results = system.repurpose(
+        args.disease,
+        top_k=args.top_k,
+        explain_top=args.explain_top
+    )

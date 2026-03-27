@@ -112,6 +112,7 @@ class PathwayScorer:
             drug_names = list(self.drug_targets.keys())
 
         raw_scores = {}
+        drug_pathways_detail = {}  # drug -> [(pathway_name, pval), ...]
         for drug_name in drug_names:
             drug_lower = drug_name.lower().strip()
             targets = self.drug_targets.get(drug_lower)
@@ -119,6 +120,7 @@ class PathwayScorer:
                 continue
 
             best_pval = 1.0
+            pw_hits = []  # (pathway_name, pval)
             for pw_name, pw_disease_prots in disease_pathways.items():
                 pw_all_prots = self.pathway_proteins[pw_name]
 
@@ -136,11 +138,17 @@ class PathwayScorer:
                          [pw_not_drug, max(neither, 0)]]
                 _, pval = stats.fisher_exact(table, alternative="greater")
 
+                pw_hits.append((pw_name, pval))
                 if pval < best_pval:
                     best_pval = pval
 
             if best_pval < 1.0:
                 raw_scores[drug_name] = -np.log10(best_pval + 1e-300)
+                # Keep top 3 pathways sorted by p-value (best first)
+                pw_hits.sort(key=lambda x: x[1])
+                drug_pathways_detail[drug_name] = [
+                    name for name, _ in pw_hits[:3]
+                ]
 
         if not raw_scores:
             return {}
@@ -158,7 +166,12 @@ class PathwayScorer:
             else:
                 results[drug] = 1.0
 
+        self._last_pathways = drug_pathways_detail
         return results
+
+    def get_drug_pathways(self):
+        """Get top pathway names per drug from last scoring run."""
+        return getattr(self, "_last_pathways", {})
 
     def is_available_for_drug(self, drug_name):
         if not self.drug_targets:

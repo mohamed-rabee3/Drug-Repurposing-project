@@ -124,11 +124,50 @@ class LiteratureScorer:
                 pmid_el = article.find(".//PMID")
                 pmid = pmid_el.text if pmid_el is not None else ""
 
+                # Extract first author last name
+                first_author = ""
+                author_count = 0
+                author_list = article.find(".//AuthorList")
+                if author_list is not None:
+                    authors = author_list.findall("Author")
+                    author_count = len(authors)
+                    if authors:
+                        last_name_el = authors[0].find("LastName")
+                        if last_name_el is not None and last_name_el.text:
+                            first_author = last_name_el.text
+
+                # Extract publication year
+                pub_year = ""
+                year_el = article.find(".//PubDate/Year")
+                if year_el is not None and year_el.text:
+                    pub_year = year_el.text
+                else:
+                    # Try MedlineDate as fallback
+                    medline_el = article.find(".//PubDate/MedlineDate")
+                    if medline_el is not None and medline_el.text:
+                        # MedlineDate format: "2023 Jan-Feb" or similar
+                        parts = medline_el.text.split()
+                        if parts and parts[0].isdigit():
+                            pub_year = parts[0]
+
+                # Build citation: "Smith et al., 2023"
+                citation = ""
+                if first_author and pub_year:
+                    if author_count > 1:
+                        citation = f"{first_author} et al., {pub_year}"
+                    else:
+                        citation = f"{first_author}, {pub_year}"
+                elif first_author:
+                    citation = first_author
+                elif pub_year:
+                    citation = pub_year
+
                 if abstract_text:
                     abstracts.append({
                         "pmid": pmid,
                         "title": title,
                         "abstract": abstract_text[:2000],
+                        "citation": citation,
                     })
         except Exception:
             pass
@@ -216,11 +255,15 @@ class LiteratureScorer:
                     scores.append(s)
                 llm_score = np.mean(scores) / 10.0  # Normalize to [0, 1]
 
+            # Collect citations from abstracts
+            citations = [a["citation"] for a in abstracts if a.get("citation")]
+
             raw_scores[drug_name] = {
                 "cooccurrence": cooccurrence,
                 "llm_relevance": llm_score,
                 "count": count,
                 "abstracts_analyzed": len(abstracts),
+                "citations": citations[:5],
             }
 
         if not raw_scores:

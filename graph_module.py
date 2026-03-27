@@ -267,20 +267,34 @@ class DrugRepurposingGNN:
             disease_emb = h['disease'][disease_idx]
             drug_embs = h['drug']
 
-            # Score via dot product + sigmoid
-            scores = torch.sigmoid(torch.matmul(drug_embs, disease_emb))
-            scores = scores.cpu().numpy()
+            # Score via dot product (raw, no sigmoid — avoids saturation)
+            raw_scores = torch.matmul(drug_embs, disease_emb)
+            raw_scores = raw_scores.detach().cpu().numpy()
 
             drug_names = self._drug_names
+            n_drugs = len(raw_scores)
 
-            # Rank and return top-K
-            ranked_indices = np.argsort(scores)[::-1][:top_k]
+            # Rank by raw dot product
+            ranked_indices = np.argsort(raw_scores)[::-1][:top_k]
+            top_scores = raw_scores[ranked_indices]
+
+            # Percentile-based normalization: score = percentile rank
+            # among ALL drugs (not just top-K). This always produces
+            # well-spread scores even when raw values are close.
+            all_ranked = np.argsort(raw_scores)[::-1]
+            rank_of = np.empty(n_drugs, dtype=int)
+            rank_of[all_ranked] = np.arange(n_drugs)
+
+            normed = np.array([
+                1.0 - rank_of[idx] / (n_drugs - 1) for idx in ranked_indices
+            ])
+
             results = []
-            for idx in ranked_indices:
+            for i, idx in enumerate(ranked_indices):
                 name = drug_names.get(int(idx), f"drug_{idx}") if drug_names else f"drug_{idx}"
                 results.append({
                     "drug_idx": int(idx),
-                    "score": float(scores[idx]),
+                    "score": float(normed[i]),
                     "drug_name": name,
                     "drug": name,
                 })

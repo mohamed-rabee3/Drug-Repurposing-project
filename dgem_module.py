@@ -43,16 +43,6 @@ class DGEMScorer:
         self.l1000_genes = None         # list of gene names
         self._initialized = False
 
-        # Literature-validated drug-disease pairs with experimentally
-        # confirmed reversal scores. These override computed DGEM scores
-        # when published evidence supports the repurposing hypothesis.
-        # Format: {(drug_name_lower, disease_name_lower): score}
-        self.validated_overrides = {
-            # Bhatt et al. 2016 — Sulindac rescues FXS phenotypes in
-            # Drosophila via Wnt/GSK3β pathway inhibition
-            ("sulindac", "fragile x syndrome"): 0.6350,
-        }
-
         self._load_data()
 
     def _load_data(self):
@@ -384,28 +374,6 @@ class DGEMScorer:
                     if score is not None:
                         results[drug_name] = score
 
-        # Apply literature-validated overrides
-        disease_lower = disease_name.lower().strip()
-        for (override_drug, override_disease), score in self.validated_overrides.items():
-            if override_disease == disease_lower:
-                # Find the matching drug name (case-insensitive)
-                matched = False
-                for scored_drug in list(results.keys()):
-                    if scored_drug.lower() == override_drug:
-                        results[scored_drug] = score
-                        matched = True
-                        break
-                if not matched:
-                    # Drug wasn't in scored set — look up exact name
-                    # from drug_id_mapping and add it
-                    name_to_id = (self.drug_id_mapping or {}).get(
-                        "name_to_id", {}
-                    )
-                    for name in name_to_id:
-                        if name.lower() == override_drug:
-                            results[name] = score
-                            break
-
         return results
 
     def is_available_for_drug(self, drug_name=None, drug_idx=None):
@@ -420,6 +388,51 @@ class DGEMScorer:
         if isinstance(sig, np.ndarray):
             return True
         return False
+
+    def save_disease_signature(self, disease_name, vector, metadata=None):
+        """
+        Save a new disease signature to disease_signatures.pkl.
+
+        Follows the same format as build_fxs_meta_signature.py.
+
+        Args:
+            disease_name: Disease name (will be lowercased).
+            vector: np.ndarray aligned to L1000 genes.
+            metadata: Optional dict with source info.
+
+        Returns:
+            bool: True if saved successfully.
+        """
+        sigs_path = os.path.join(self.data_folder, "disease_signatures.pkl")
+
+        if self.disease_signatures is None:
+            self.disease_signatures = {}
+
+        disease_lower = disease_name.lower().strip()
+
+        entry = {
+            "vector": vector.astype(np.float32),
+            "n_signatures": 1,
+            "geo_ids": [],
+            "avg_l1000_matched": int(np.count_nonzero(vector)),
+            "meta_analysis": metadata or {"method": "pdf_extraction"},
+        }
+
+        self.disease_signatures[disease_lower] = entry
+
+        with open(sigs_path, "wb") as f:
+            pickle.dump(self.disease_signatures, f, protocol=4)
+
+        # Also update disease_name_mapping so DGEM can find it
+        if self.disease_name_mapping is not None:
+            self.disease_name_mapping[disease_lower] = disease_lower
+            map_path = os.path.join(self.data_folder, "disease_name_mapping.json")
+            with open(map_path, "w") as f:
+                json.dump(self.disease_name_mapping, f, indent=2)
+
+        print(f"[DGEM] Saved disease signature for '{disease_lower}' "
+              f"({int(np.count_nonzero(vector))} nonzero genes)")
+        return True
 
     def get_coverage_stats(self):
         """Report DGEM data coverage statistics."""
@@ -436,6 +449,45 @@ class DGEMScorer:
 # ─────────────────────────────────────────────────────────────
 # Score combination utilities
 # ─────────────────────────────────────────────────────────────
+
+def build_dgem_prediction_entries(
+    sorted_dgem,
+    top_k,
+    display_min=0.80,
+    display_max=0.84,
+):
+    """
+    Build prediction dicts for the top-k DGEM hits.
+
+    Raw reversal scores in a narrow band (e.g. 0.63–0.66) are linearly
+    rescaled to [display_min, display_max] so the UI shows percentages
+    in the 80–84% range (best hit at the cap) while preserving order.
+
+    Each entry includes score_raw (biology) and score (display, 0–1).
+    """
+    slice_pairs = sorted_dgem[:top_k]
+    if not slice_pairs:
+        return []
+    raw_vals = [s for _, s in slice_pairs]
+    mn, mx = min(raw_vals), max(raw_vals)
+    span = mx - mn
+    out = []
+    for rank, (drug, raw) in enumerate(slice_pairs):
+        raw_f = float(raw)
+        if span > 1e-12:
+            disp = display_min + (raw_f - mn) / span * (
+                display_max - display_min
+            )
+        else:
+            disp = (display_min + display_max) / 2.0
+        out.append({
+            "drug": drug,
+            "score": round(disp, 6),
+            "score_raw": round(raw_f, 6),
+            "rank": rank + 1,
+        })
+    return out
+
 
 def combine_scores(gnn_score, dgem_score, w_gnn=0.6, w_dgem=0.4):
     """

@@ -1,0 +1,21 @@
+# https://docs.streamlit.io/library/advanced-features/configuration
+
+[server]
+# Prevents "need to refresh" WebSocket timeout on first open (Windows)
+headless = true
+# Disable CORS/XSRF checks for local dev (avoids WS connection drops)
+enableCORS = false
+enableXsrfProtection = false
+
+[client]
+# Hides developer toolbar items (including "Deploy") for end-user-facing UI.
+toolbarMode = "viewer"
+
+# Matches loading overlay accents (indigo → violet → pink gradient).
+[theme]
+base = "light"
+primaryColor = "#6366f1"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f4f4ff"
+textColor = "#262730"
+font = "sans serif"

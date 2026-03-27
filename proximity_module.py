@@ -125,6 +125,7 @@ class ProximityScorer:
         default_dist = cutoff + 1
 
         raw_scores = {}
+        drug_proximity_detail = {}  # drug -> {targets: [...], shortest_path: float}
         for drug_name in drug_names:
             drug_lower = drug_name.lower().strip()
             targets = self.drug_targets.get(drug_lower)
@@ -133,7 +134,9 @@ class ProximityScorer:
 
             # For each drug target, find min distance to disease proteins
             target_dists = []
+            target_names = []
             for t in targets:
+                target_names.append(t)
                 if t in distances:
                     target_dists.append(distances[t])
                 else:
@@ -143,8 +146,16 @@ class ProximityScorer:
                 continue
 
             mean_dist = np.mean(target_dists)
+            min_dist = min(target_dists)
             # Convert distance to score: closer = higher
             raw_scores[drug_name] = 1.0 / (1.0 + mean_dist)
+
+            # Store details: target names and shortest path
+            drug_proximity_detail[drug_name] = {
+                "targets": target_names,
+                "shortest_path": int(min_dist),
+                "mean_distance": round(float(mean_dist), 2),
+            }
 
         if not raw_scores:
             return {}
@@ -162,7 +173,12 @@ class ProximityScorer:
             else:
                 results[drug] = 1.0
 
+        self._last_details = drug_proximity_detail
         return results
+
+    def get_drug_details(self):
+        """Get target names and shortest path per drug from last scoring run."""
+        return getattr(self, "_last_details", {})
 
     def is_available_for_drug(self, drug_name):
         if not self.drug_targets:

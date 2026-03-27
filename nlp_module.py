@@ -240,21 +240,38 @@ class BiomedicalNLP:
             result["disease_name"] = disease_name
         return result
 
-    def generate_report(self, disease_name, drug_predictions):
+    def generate_report(self, disease_name, drug_predictions,
+                        module="txgnn"):
         """
         Generate a comprehensive drug repurposing report.
 
         Args:
             disease_name: The target disease.
-            drug_predictions: List of dicts from the GNN module.
+            drug_predictions: List of dicts with at least 'drug' and 'score'.
+                For DGEM entries, 'score_raw' (0-1 reversal) is preferred
+                in the prompt when present.
+            module: 'dgem' (gene expression reversal) or 'txgnn' (GNN).
 
         Returns:
             String — a formatted markdown report.
         """
-        drug_list = "\n".join([
-            f"  {i+1}. {d['drug']} (confidence score: {d['score']:.3f})"
-            for i, d in enumerate(drug_predictions[:10])
-        ])
+        lines = []
+        for i, d in enumerate(drug_predictions[:10]):
+            drug = d.get("drug", "Unknown")
+            if module == "dgem" and "score_raw" in d:
+                s = float(d["score_raw"])
+                lines.append(
+                    f"  {i+1}. {drug} (DGEM raw reversal score 0-1: {s:.3f})"
+                )
+            else:
+                s = float(d.get("score", 0))
+                label = (
+                    "GNN confidence (0-1)"
+                    if module == "txgnn"
+                    else "score (0-1)"
+                )
+                lines.append(f"  {i+1}. {drug} ({label}: {s:.3f})")
+        drug_list = "\n".join(lines)
 
         system_prompt = (
             "You are a clinical research consultant writing a "
@@ -263,19 +280,46 @@ class BiomedicalNLP:
             "note limitations."
         )
 
-        user_prompt = (
-            f"Write a drug repurposing report for:\n\n"
-            f"Disease: {disease_name}\n\n"
-            f"AI-predicted drug candidates (ranked by GNN confidence score):\n"
-            f"{drug_list}\n\n"
-            "For each of the top 5 drugs, include:\n"
-            "1. Known mechanism of action\n"
-            "2. Why it might work for this disease\n"
-            "3. Existing evidence (if any)\n"
-            "4. Safety considerations\n"
-            "5. Recommended next steps\n\n"
-            "End with an overall summary and limitations section."
-        )
+        if module == "dgem":
+            user_prompt = (
+                f"Write a drug repurposing report for:\n\n"
+                f"Disease: {disease_name}\n\n"
+                "Methodology to describe in the report: candidates were ranked "
+                "by Drug–Gene Expression Matching (DGEM): each drug's "
+                "expression perturbation profile (L1000-style) is compared to "
+                "the disease signature; higher scores indicate stronger "
+                "predicted reversal of disease-associated expression (Connectivity "
+                "Map hypothesis). This is orthogonal to target-based GNN scores — "
+                "do NOT refer to Graph Neural Networks or GNN confidence for "
+                "these candidates.\n\n"
+                f"DGEM-ranked drug candidates:\n{drug_list}\n\n"
+                "In the report title and tables, use terminology such as "
+                "'DGEM reversal score' or 'gene expression match' — never "
+                "'GNN' or 'graph neural network' for this ranking.\n\n"
+                "For each of the top 5 drugs, include:\n"
+                "1. Known mechanism of action\n"
+                "2. Why it might work for this disease\n"
+                "3. Existing evidence (if any)\n"
+                "4. Safety considerations\n"
+                "5. Recommended next steps\n\n"
+                "End with an overall summary and limitations section. Clearly "
+                "state that DGEM scores reflect computational expression "
+                "concordance, not clinical efficacy or safety."
+            )
+        else:
+            user_prompt = (
+                f"Write a drug repurposing report for:\n\n"
+                f"Disease: {disease_name}\n\n"
+                f"AI-predicted drug candidates (ranked by GNN confidence score):\n"
+                f"{drug_list}\n\n"
+                "For each of the top 5 drugs, include:\n"
+                "1. Known mechanism of action\n"
+                "2. Why it might work for this disease\n"
+                "3. Existing evidence (if any)\n"
+                "4. Safety considerations\n"
+                "5. Recommended next steps\n\n"
+                "End with an overall summary and limitations section."
+            )
 
         return self._call_groq(
             system_prompt, user_prompt,

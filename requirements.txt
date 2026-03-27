@@ -39,3 +39,6 @@ GEOparse
 
 # Pathway + Proximity modules
 networkx
+
+# Research PDF Analysis module
+pdfplumber>=0.10
